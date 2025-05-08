@@ -20,7 +20,11 @@ class GeoData:
         self.level = level
         if level == 'tract':
             self.gdf = gpd.read_file(filepath)
-            self.gdf = self.gdf[self.gdf['GEOIDFQ'].isin(geoid_list)]
+            self.gdf["short_GEOID"] = self.gdf["GEOID"].str[-6:]
+            self.gdf.set_index("short_GEOID", inplace=True)
+            self.short_geoid_list = [geoid[-6:] for geoid in geoid_list]
+            # Retrieve tracts with the specified GEOIDs
+            self.gdf = self.gdf.loc[self.short_geoid_list]            
         
         elif level == 'block_group':
             self.gdf = gpd.read_file(filepath)
@@ -32,25 +36,30 @@ class GeoData:
 
         elif level == 'block':
             self.gdf = gpd.read_file(filepath)
-            self.gdf = self.gdf[self.gdf["GEOIDFQ20"].str.startswith(tuple(geoid_list))]
+            self.gdf["short_GEOID"] = self.gdf["GEOID20"].str[-10:]
+            tract_short_geoid_list = [geoid[-6:] for geoid in geoid_list]
+            self.gdf = self.gdf[self.gdf["short_GEOID"].str.startswith(tuple(tract_short_geoid_list))]
+            self.gdf.set_index("short_GEOID", inplace=True)
 
 
         if self.gdf.crs.is_geographic:
             self.gdf = self.gdf.to_crs(epsg=2163)
         
-        # Calculate the area for each tract
+        # Calculate the area for each geometry in square kilometers
+        # Note: The area is calculated in the projected coordinate system (EPSG:2163)
         self.gdf['area'] = self.gdf.geometry.area / 1e6 # Convert to square kilometers
 
         # Compute contiguity weights
-        w = Queen.from_dataframe(self.gdf, use_index=False)
+        w = Queen.from_dataframe(self.gdf, use_index=True)
         # Build graph using indices from gdf_subset
         self.G = nx.Graph()
-        for tract, neighbors in w.neighbors.items():
+        for node, neighbors in w.neighbors.items():
             for neighbor in neighbors:
-                self.G.add_edge(tract, neighbor)
+                self.G.add_edge(node, neighbor)
 
         # Use centroids of each part for node positions
-        self.pos = {i: (geom.centroid.x, geom.centroid.y) for i, geom in enumerate(self.gdf.geometry)}
+        self.pos = {short_geoid: (geom.centroid.x, geom.centroid.y) for short_geoid, geom in self.gdf.geometry.items()}
+        # self.pos = {i: (geom.centroid.x, geom.centroid.y) for i, geom in enumerate(self.gdf.geometry)}
 
         # Compute Euclidean distances between centroids for each edge
         self.edge_labels = {}
@@ -96,8 +105,6 @@ class GeoData:
         commuting_df['commuting_demand'] = commuting_df['population%'] * commuting_df['total_commuting']
         
 
-        
-
     def plot_graph(self, savepath='./figures/'):
         # Plot the tracts and overlay the graph with distance labels
         fig, ax = plt.subplots(figsize=(30, 30))
@@ -109,6 +116,7 @@ class GeoData:
             nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=self.edge_labels, font_color='green', font_size=2)
         plt.savefig(f"{savepath}{self.level}_graph.png", dpi=300, bbox_inches='tight')
         plt.close(fig)
+
 
 class DemandData:
     def __init__(self, meta_path, data_path, level='tract', datatype='commuting'):
