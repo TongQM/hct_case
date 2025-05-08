@@ -83,6 +83,9 @@ class GeoData:
 
     def get_area(self, bg_geoid):
         return self.gdf['area'][bg_geoid]
+    
+    def get_dist(self, node1, node2):
+        return self.shortest_distance_dict[(node1, node2)]
 
     def generate_demand_dist(self, commuting_df, population_df):
         # Population ratio manipulation
