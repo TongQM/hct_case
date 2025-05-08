@@ -1,0 +1,10 @@
+2020_target_block_population/
+2023_shape_files/
+2023_target_blockgroup_population/
+2023_target_tract_commuting/
+prev_version/
+visualizations/
+
+*.xlsx
+*.csv
+*.zip
