@@ -97,6 +97,11 @@ class GeoData:
         return self.shortest_distance_dict[(node1, node2)]
 
     def generate_demand_dist(self, commuting_df, population_df):
+        '''
+        Legacy code for generating demand distribution based on population and commuting data.
+        This function is not used in the current implementation.
+        It is recommended to construct the probaility distribution based on the demand data directly.
+        '''
         # Population ratio manipulation
         selected_columns = ['Geography', 'Geographic Area Name', 'Estimate Total:']
         block_group_pop_data = population_df[selected_columns]
@@ -372,17 +377,20 @@ class RouteData:
         return assignment, center_list
 
 
-    def evaluate_partition(self, assignment):
+    def evaluate_partition(self, assignment, mode="fixed"):
         """
         Evaluate the partition of nodes into districts.
         
         Parameters:
         assignment (np.ndarray): Binary array of shape (n_block_groups, n_centers),
                                 where each row has exactly one 1.
+        mode (str): Mode of evaluation, either "fixed" or "tsp".
         
         Returns:
         centers (dict): Dictionary mapping each district (center index) to its center block group id.
         """
+        assert mode in ["fixed", "tsp"], "Invalid mode. Choose 'fixed' or 'tsp'."
+
         # Convert binary assignment to a district label per block group.
         district_labels = np.argmax(assignment, axis=1)
         gdf = self.gdf.copy()
