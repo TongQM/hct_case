@@ -179,7 +179,7 @@ class GeoData:
  
 
 class RouteData:
-    def __init__(self, data_path, gdf):
+    def __init__(self, data_path, geodata: GeoData):
 
         assert data_path.endswith('.json'), "Data path must be a JSON file."
 
@@ -187,7 +187,10 @@ class RouteData:
         with open(data_path, "r") as f:
             self.routes_info = json.load(f)
 
-        self.gdf = gdf
+        self.geodata = geodata
+        self.short_geoid_list = geodata.short_geoid_list
+        self.level = geodata.level
+        self.gdf = geodata.gdf
 
         # Create a transformer from EPSG:4326 (lat/lon) to EPSG:2163 (projected in meters)
         self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:2163", always_xy=True)
@@ -259,7 +262,7 @@ class RouteData:
         return stops_dict
 
 
-    def get_fixed_route_assignment(self):
+    def _get_fixed_route_assignment(self, visualize=True):
         """
         Partition nodes into Districts based on the nearest stop, then plot with proper legend.
         """
@@ -290,78 +293,126 @@ class RouteData:
                 if d < best_dist:
                     best_dist, best_idx = d, idx
             center_nodes[district] = best_idx
-
-        # Plotting
-        unique_districts = self.gdf['district'].unique()
-        cmap = cm.get_cmap('Set1', len(unique_districts))
-        color_map = {d: cmap(i) for i, d in enumerate(unique_districts)}
-
-        fig, ax = plt.subplots(figsize=(15, 15))
-        for district in unique_districts:
-            subset = self.gdf[self.gdf['district'] == district]
-            subset.plot(ax=ax, color=color_map[district], edgecolor='black')
-
-        # Overlay routes
-        for route in self.routes_info:
-            name = route.get("Description", f"Route {route.get('RouteID')}")
-            poly = route.get("EncodedPolyline")
-            color = route.get("MapLineColor", '#000000')
-            if poly:
-                try:
-                    coords = polyline.decode(poly)
-                    line = LineString([(lng, lat) for lat, lng in coords])
-                    proj_line = self.project_geometry(line)
-                    ax.plot(*proj_line.xy, color=color, linewidth=2)
-                except Exception as e:
-                    print(f"Error decoding polyline for {name}: {e}")
-
-        # Plot centers
-        for district, idx in center_nodes.items():
-            geom = self.gdf.loc[idx].geometry
-            boundary = getattr(geom, 'exterior', geom.boundary)
-            ax.plot(*boundary.xy, color='red', linewidth=3)
-            pt = geom.centroid
-            ax.plot(pt.x, pt.y, 'o', color='red', markersize=10)
-            ax.text(pt.x, pt.y, str(district), fontsize=12, fontweight='bold',
-                    color='red', ha='center', va='center')
-
-        # Build custom legend for districts
-        legend_handles = [
-            mpatches.Patch(facecolor=color_map[d], edgecolor='black', label=str(d))
-            for d in unique_districts
-        ]
-        ax.legend(handles=legend_handles, title='District', loc='upper right')
-        plt.title("Partition of Block Groups into Districts by Nearest Route Stop")
-        plt.show()
+        self.center_nodes = center_nodes
 
 
+        if visualize:
+            # Plotting
+            unique_districts = self.gdf['district'].unique()
+            cmap = cm.get_cmap('Set1', len(unique_districts))
+            color_map = {d: cmap(i) for i, d in enumerate(unique_districts)}
 
+            fig, ax = plt.subplots(figsize=(15, 15))
+            for district in unique_districts:
+                subset = self.gdf[self.gdf['district'] == district]
+                subset.plot(ax=ax, color=color_map[district], edgecolor='black')
 
-class DemandData:
-    def __init__(self, meta_path, data_path, level='tract', datatype='commuting'):
+            # Overlay routes
+            for route in self.routes_info:
+                name = route.get("Description", f"Route {route.get('RouteID')}")
+                poly = route.get("EncodedPolyline")
+                color = route.get("MapLineColor", '#000000')
+                if poly:
+                    try:
+                        coords = polyline.decode(poly)
+                        line = LineString([(lng, lat) for lat, lng in coords])
+                        proj_line = self.project_geometry(line)
+                        ax.plot(*proj_line.xy, color=color, linewidth=2)
+                    except Exception as e:
+                        print(f"Error decoding polyline for {name}: {e}")
+
+            # Plot centers
+            for district, idx in center_nodes.items():
+                geom = self.gdf.loc[idx].geometry
+                boundary = getattr(geom, 'exterior', geom.boundary)
+                ax.plot(*boundary.xy, color='red', linewidth=3)
+                pt = geom.centroid
+                ax.plot(pt.x, pt.y, 'o', color='red', markersize=10)
+                ax.text(pt.x, pt.y, str(district), fontsize=12, fontweight='bold',
+                        color='red', ha='center', va='center')
+
+            # Build custom legend for districts
+            legend_handles = [
+                mpatches.Patch(facecolor=color_map[d], edgecolor='black', label=str(d))
+                for d in unique_districts
+            ]
+            ax.legend(handles=legend_handles, title='District', loc='upper right')
+            plt.title("Partition of Block Groups into Districts by Nearest Route Stop")
+            plt.show()
+
+    def build_assignment_matrix(self, visualize=True):
         """
-        Load data from a CSV file and rename columns based on metadata.
+        Construct a binary assignment matrix where entry (i, j) = 1 if the i-th block group
+        (in self.short_geoid_list) is assigned to the center corresponding to the j-th center.
+
+        Returns:
+            assignment: np.ndarray of shape (n_groups, n_centers)
+            center_list: list of center node identifiers (short GEOID index)
+        """
+        
+        self._get_fixed_route_assignment(visualize=visualize)
+        center_list = list(self.center_nodes.values())
+        n_groups = len(self.short_geoid_list)
+        n_centers = len(center_list)
+        assignment = np.zeros((n_groups, n_centers), dtype=int)
+
+        # Map geoid to row index
+        geo_to_row = {geoid: i for i, geoid in enumerate(self.short_geoid_list)}
+        # Map center idx to column
+        center_to_col = {center: j for j, center in enumerate(center_list)}
+
+        for geoid in self.short_geoid_list:
+            i = geo_to_row[geoid]
+            district = self.gdf.loc[geoid, 'district']
+            center = self.center_nodes[district]
+            j = center_to_col[center]
+            assignment[i, j] = 1
+
+        return assignment, center_list
+
+
+    def evaluate_partition(self, assignment):
+        """
+        Evaluate the partition of nodes into districts.
         
         Parameters:
-        - meta_path: Path to the metadata CSV file.
-        - data_path: Path to the data CSV file.
+        assignment (np.ndarray): Binary array of shape (n_block_groups, n_centers),
+                                where each row has exactly one 1.
         
         Returns:
-        - DataFrame with renamed columns.
+        centers (dict): Dictionary mapping each district (center index) to its center block group id.
         """
-        assert datatype in ['commuting', 'population'], "Invalid datatype. Choose 'commuting' or 'population'."
-        if datatype == 'commuting' and level != 'tract':
-            raise ValueError("Commuting data is only available at the tract level.")
+        # Convert binary assignment to a district label per block group.
+        district_labels = np.argmax(assignment, axis=1)
+        gdf = self.gdf.copy()
+
+
+
+# class DemandData:
+#     def __init__(self, meta_path, data_path, level='tract', datatype='commuting'):
+#         """
+#         Load data from a CSV file and rename columns based on metadata.
         
-        self.level = level
-        meta = pd.read_csv(meta_path)
-        code_to_label = dict(zip(meta["Column Name"], meta["Label"]))
+#         Parameters:
+#         - meta_path: Path to the metadata CSV file.
+#         - data_path: Path to the data CSV file.
         
-        self.data = pd.read_csv(data_path)
-        self.data.rename(columns=code_to_label, inplace=True)
+#         Returns:
+#         - DataFrame with renamed columns.
+#         """
+#         assert datatype in ['commuting', 'population'], "Invalid datatype. Choose 'commuting' or 'population'."
+#         if datatype == 'commuting' and level != 'tract':
+#             raise ValueError("Commuting data is only available at the tract level.")
         
-        # Remove "!!" from column names
-        self.data.columns = self.data.columns.str.replace("!!", " ", regex=False)
+#         self.level = level
+#         meta = pd.read_csv(meta_path)
+#         code_to_label = dict(zip(meta["Column Name"], meta["Label"]))
+        
+#         self.data = pd.read_csv(data_path)
+#         self.data.rename(columns=code_to_label, inplace=True)
+        
+#         # Remove "!!" from column names
+#         self.data.columns = self.data.columns.str.replace("!!", " ", regex=False)
 
 
 def load_data(meta_path, data_path):
