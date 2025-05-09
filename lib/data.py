@@ -1,9 +1,16 @@
 import geopandas as gpd
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.patches as mpatches
 import networkx as nx
 import pandas as pd
 from libpysal.weights import Queen
+import polyline
+import json
+from shapely.geometry import LineString, Point
+from shapely.ops import transform
+from pyproj import Transformer
 
 
 class GeoData:
@@ -169,6 +176,164 @@ class GeoData:
         plt.show()
         
         return centers
+ 
+
+class RouteData:
+    def __init__(self, data_path, gdf):
+
+        assert data_path.endswith('.json'), "Data path must be a JSON file."
+
+        # Load the routes info from a JSON file
+        with open(data_path, "r") as f:
+            self.routes_info = json.load(f)
+
+        self.gdf = gdf
+
+        # Create a transformer from EPSG:4326 (lat/lon) to EPSG:2163 (projected in meters)
+        self.transformer = Transformer.from_crs("EPSG:4326", "EPSG:2163", always_xy=True)
+
+    def project_geometry(self, geometry):
+        """Project a shapely geometry from EPSG:4326 to EPSG:2163."""
+        return transform(self.transformer.transform, geometry)
+
+    def visualize_routes_and_nodes(self):
+        """
+        Visualize routes overlaid on level nodes (projected in EPSG:2163),
+        and return a dictionary mapping each route name to a list of stop info.
+        
+        Parameters:
+        gdf (GeoDataFrame): Node polygons (CRS EPSG:2163).
+        routes_info (list): List of route dictionaries, each with keys:
+            - "Description": route name.
+            - "EncodedPolyline": encoded polyline string.
+            - "MapLineColor": color for plotting.
+            - "Stops": list of stop dictionaries with keys "Latitude", "Longitude", "Description".
+            
+        Returns:
+            dict: Keys are route names, and values are lists of stop info dictionaries.
+        """
+        stops_dict = {}
+        
+        fig, ax = plt.subplots(figsize=(15, 15))
+        
+        # Plot block groups as the base layer (already in EPSG:2163)
+        self.gdf.plot(ax=ax, color='lightgrey', edgecolor='black')
+        
+        for route in self.routes_info:
+            route_name = route.get("Description", "Unnamed Route")
+            encoded_poly = route.get("EncodedPolyline")
+            color = route.get("MapLineColor", "#000000")
+            stops = route.get("Stops", [])
+            
+            # Decode the polyline (originally in lat/lon) and project to EPSG:2163.
+            if encoded_poly:
+                try:
+                    # Decode returns (lat, lng) pairs. Swap to (lng, lat) for shapely.
+                    coords = polyline.decode(encoded_poly)
+                    coords_swapped = [(lng, lat) for lat, lng in coords]
+                    route_line = LineString(coords_swapped)
+                    projected_line = self.project_geometry(route_line)
+                    ax.plot(*projected_line.xy, color=color, linewidth=2, label=route_name)
+                except Exception as e:
+                    print(f"Error decoding polyline for route '{route_name}': {e}")
+            
+            route_stops = []
+            for stop in stops:
+                lat = stop.get("Latitude")
+                lng = stop.get("Longitude")
+                desc = stop.get("Description", "")
+                route_stops.append({"Latitude": lat, "Longitude": lng, "Description": desc})
+                
+                # Create a Point and project it
+                pt = Point(lng, lat)
+                projected_pt = self.project_geometry(pt)
+                ax.scatter(projected_pt.x, projected_pt.y, color=color, s=50, edgecolor='k', zorder=5)
+                ax.text(projected_pt.x, projected_pt.y, desc, fontsize=8, color=color)
+            
+            stops_dict[route_name] = route_stops
+
+        ax.set_title("Routes and Block Groups (EPSG:2163 Projection)")
+        ax.legend()
+        plt.show()
+        
+        return stops_dict
+
+
+    def get_fixed_route_assignment(self):
+        """
+        Partition nodes into Districts based on the nearest stop, then plot with proper legend.
+        """
+        # Assign each block group to nearest route
+        district_assignment = {}
+        for idx, row in self.gdf.iterrows():
+            centroid = row.geometry.centroid
+            best_route, best_dist = None, float('inf')
+            for route in self.routes_info:
+                name = route.get("Description", f"Route {route.get('RouteID')}")
+                for stop in route.get("Stops", []):
+                    pt = Point(stop['Longitude'], stop['Latitude'])
+                    pt_proj = self.project_geometry(pt)
+                    d = centroid.distance(pt_proj)
+                    if d < best_dist:
+                        best_dist, best_route = d, name
+            district_assignment[idx] = best_route
+        self.gdf['district'] = self.gdf.index.map(district_assignment)
+
+        # Find center of each district
+        center_nodes = {}
+        for district, group in self.gdf.groupby('district'):
+            centroids = group.geometry.centroid
+            mean_point = Point(centroids.x.mean(), centroids.y.mean())
+            best_idx, best_dist = None, float('inf')
+            for idx, geom in group.geometry.items():
+                d = geom.centroid.distance(mean_point)
+                if d < best_dist:
+                    best_dist, best_idx = d, idx
+            center_nodes[district] = best_idx
+
+        # Plotting
+        unique_districts = self.gdf['district'].unique()
+        cmap = cm.get_cmap('Set1', len(unique_districts))
+        color_map = {d: cmap(i) for i, d in enumerate(unique_districts)}
+
+        fig, ax = plt.subplots(figsize=(15, 15))
+        for district in unique_districts:
+            subset = self.gdf[self.gdf['district'] == district]
+            subset.plot(ax=ax, color=color_map[district], edgecolor='black')
+
+        # Overlay routes
+        for route in self.routes_info:
+            name = route.get("Description", f"Route {route.get('RouteID')}")
+            poly = route.get("EncodedPolyline")
+            color = route.get("MapLineColor", '#000000')
+            if poly:
+                try:
+                    coords = polyline.decode(poly)
+                    line = LineString([(lng, lat) for lat, lng in coords])
+                    proj_line = self.project_geometry(line)
+                    ax.plot(*proj_line.xy, color=color, linewidth=2)
+                except Exception as e:
+                    print(f"Error decoding polyline for {name}: {e}")
+
+        # Plot centers
+        for district, idx in center_nodes.items():
+            geom = self.gdf.loc[idx].geometry
+            boundary = getattr(geom, 'exterior', geom.boundary)
+            ax.plot(*boundary.xy, color='red', linewidth=3)
+            pt = geom.centroid
+            ax.plot(pt.x, pt.y, 'o', color='red', markersize=10)
+            ax.text(pt.x, pt.y, str(district), fontsize=12, fontweight='bold',
+                    color='red', ha='center', va='center')
+
+        # Build custom legend for districts
+        legend_handles = [
+            mpatches.Patch(facecolor=color_map[d], edgecolor='black', label=str(d))
+            for d in unique_districts
+        ]
+        ax.legend(handles=legend_handles, title='District', loc='upper right')
+        plt.title("Partition of Block Groups into Districts by Nearest Route Stop")
+        plt.show()
+
 
 
 
