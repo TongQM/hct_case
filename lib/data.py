@@ -48,6 +48,7 @@ class GeoData:
             tract_short_geoid_list = [geoid[-6:] for geoid in geoid_list]
             self.gdf = self.gdf[self.gdf["short_GEOID"].str.startswith(tuple(tract_short_geoid_list))]
             self.gdf.set_index("short_GEOID", inplace=True)
+            self.short_geoid_list = self.gdf.index.tolist()
 
 
         if self.gdf.crs.is_geographic:
