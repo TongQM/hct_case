@@ -27,17 +27,17 @@ class Partition:
 
         assert len(block_centers) == self.num_districts, f"Got {len(block_centers)} block centers but expected {self.num_districts} districts"
 
-        assignment_indices = [(bg, center) for bg in self.short_geoid_list for center in block_centers]
+        assignment_indices = [(node, center) for node in self.short_geoid_list for center in block_centers]
 
         Hess_model = gp.Model("Hess_model")
         z = Hess_model.addVars(assignment_indices, vtype=GRB.BINARY, name="z")
-        Hess_model.addConstrs((gp.quicksum(z[bg, center] for center in block_centers) == 1 for bg in self.short_geoid_list), name="unique_assignment")
+        Hess_model.addConstrs((gp.quicksum(z[node, center] for center in block_centers) == 1 for node in self.short_geoid_list), name="unique_assignment")
         Hess_model.addConstrs((z[center, center] == 1 for center in block_centers), name="center_selection")
-        Hess_model.setObjective(gp.quicksum(z[bg, center] * self.geodata.get_dist(bg, center) for bg in self.short_geoid_list for center in block_centers), GRB.MINIMIZE)
+        Hess_model.setObjective(gp.quicksum(z[node, center] * self.geodata.get_dist(node, center) for node in self.short_geoid_list for center in block_centers), GRB.MINIMIZE)
         Hess_model.setParam('OutputFlag', 0)
         Hess_model.optimize()
 
-        block_assignment = np.array([[z[bg, center].x for center in block_centers] for bg in self.short_geoid_list])
+        block_assignment = np.array([[z[node, center].x for center in block_centers] for node in self.short_geoid_list])
         return block_assignment
 
 
@@ -198,7 +198,21 @@ class Partition:
         return best_block_centers, best_assignment, best_obj_val, worst_district_list, district_costs_list, block_centers_list
         
 
-    def local_search(self, block_centers, best_obj_val):
+    def local_search(self, block_centers, best_obj_val, criterion='lb'):
+
+        assert criterion in ['lb', 'ub'], "Criterion must be either 'lb' or 'ub'"
+        assert len(block_centers) == self.num_districts, f"Got {len(block_centers)} block centers but expected {self.num_districts} districts"
+
+        assignment = self._Hess_model(block_centers)
+        obj_dict = self._SDP(assignment, block_centers) if criterion == 'lb' else self._LP(assignment, block_centers)
+        if criterion == 'lb':
+            obj_val_dict = {node: obj_dict[node]['bhh']**2 * obj_dict[node]['district_mass'] for node in obj_dict.keys()}
+            best_obj_val = max(obj_val_dict.values())
+        elif criterion == 'ub':
+            obj_val_dict = {node: obj_dict[node]['bhh']**2 * obj_dict[node]['district_area'] for node in obj_dict.keys()}
+            best_obj_val = max(obj_val_dict.values())
+        print(f"Original objective value: {best_obj_val}")
+
         for center in block_centers:
             for neighbor in self.geodata.G.neighbors(center):
                 if neighbor not in block_centers:
@@ -206,9 +220,14 @@ class Partition:
                     new_centers.remove(center)
                     new_centers.append(neighbor)
                     new_assignment = self._Hess_model(new_centers)
-                    new_obj_dict = self._SDP(new_assignment, new_centers)
-                    new_obj_val_dict = {bg: new_obj_dict[bg]['bhh'] * math.sqrt(new_obj_dict[bg]['district_mass']) for bg in new_obj_dict.keys()}
-                    new_obj_val = max(new_obj_val_dict.values())
+                    if criterion == 'lb':
+                        new_obj_dict = self._SDP(new_assignment, new_centers)
+                        new_obj_val_dict = {node: new_obj_dict[node]['bhh']**2 * new_obj_dict[node]['district_mass'] for node in new_obj_dict.keys()}
+                        new_obj_val = max(new_obj_val_dict.values())
+                    elif criterion == 'ub':
+                        new_obj_dict = self._LP(new_assignment, new_centers)
+                        new_obj_val_dict = {node: new_obj_dict[node]['bhh']**2 * new_obj_dict[node]['district_area'] for node in new_obj_dict.keys()}
+                        new_obj_val = max(new_obj_val_dict.values())
                     
                     if new_obj_val < best_obj_val:
                         print(f"new obj val: {new_obj_val}")

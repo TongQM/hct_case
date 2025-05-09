@@ -1,4 +1,5 @@
 import geopandas as gpd
+import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 import pandas as pd
@@ -119,6 +120,56 @@ class GeoData:
             nx.draw_networkx_edge_labels(self.G, self.pos, edge_labels=self.edge_labels, font_color='green', font_size=2)
         plt.savefig(f"{savepath}{self.level}_graph.png", dpi=300, bbox_inches='tight')
         plt.close(fig)
+
+
+    def plot_partition(self, assignment):
+        """
+        Visualize the partition of block groups into districts.
+        
+        Parameters:
+        assignment (np.ndarray): Binary array of shape (n_block_groups, n_centers),
+                                where each row has exactly one 1.
+        gdf (GeoDataFrame): GeoDataFrame of block groups; order must match assignment rows.
+        
+        Returns:
+        centers (dict): Dictionary mapping each district (center index) to its center block group id.
+        """
+        # Convert binary assignment to a district label per block group.
+        district_labels = np.argmax(assignment, axis=1)
+        gdf = self.gdf.copy()  # avoid modifying the original GeoDataFrame
+        gdf['district'] = district_labels
+
+        # Create the plot with a categorical colormap.
+        fig, ax = plt.subplots(figsize=(10, 10))
+        gdf.plot(column='district', cmap='tab20', legend=True, ax=ax)
+        
+        centers = {}
+        # For each district, determine the center block group.
+        for district in np.unique(district_labels):
+            subset = gdf[gdf['district'] == district]
+            # Compute centroids of the block groups in this district.
+            centroids = subset.geometry.centroid
+            # Compute the average centroid (district centroid)
+            avg_x = centroids.x.mean()
+            avg_y = centroids.y.mean()
+            # Find the block group whose centroid is closest to the district centroid.
+            distances = centroids.apply(lambda geom: ((geom.x - avg_x)**2 + (geom.y - avg_y)**2)**0.5)
+            center_idx = distances.idxmin()  # center's index (e.g., GEOID)
+            centers[district] = center_idx
+            
+            # # Plot the boundary of the center block group with a thicker line.
+            # subset.loc[[center_idx]].boundary.plot(ax=ax, edgecolor='black', linewidth=3)
+            # Optionally, add a marker at the center.
+            # ax.plot(centroids.loc[center_idx].x, centroids.loc[center_idx].y, marker='o',
+            #         color='white', markersize=3)
+            ax.plot(avg_x, avg_y, marker='o',
+                    color='white', markersize=3)
+        
+        plt.title("District Partition with Center Block Groups")
+        plt.show()
+        
+        return centers
+
 
 
 class DemandData:
