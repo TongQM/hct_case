@@ -1,5 +1,7 @@
 import geopandas as gpd
 import numpy as np
+import gurobipy as gp
+from gurobipy import GRB
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.patches as mpatches
@@ -43,7 +45,13 @@ We will compare the different costs for different service designs.
 
 class Evaluate:
 
-    def __init__(self, routedata: RouteData, geodata: GeoData):
+    def __init__(self, routedata: RouteData, geodata: GeoData, epsilon=1e-3):
+        '''
+        Initialize the Evaluate class with route data and geo data.
+        :param routedata: RouteData object
+        :param geodata: GeoData object
+        :param epsilon: Radius for Wasserstein distance
+        '''
         
         assert isinstance(routedata, RouteData), "routedata must be of type RouteData"
         assert isinstance(geodata, GeoData), "geodata must be of type GeoData"
@@ -53,6 +61,53 @@ class Evaluate:
         self.geodata = geodata
         self.level = geodata.level
         self.short_geoid_list = geodata.short_geoid_list
+        self.epsilon = epsilon
+
+
+    def _get_fixed_route_worst_distribution(self, prob_dict):
+        """
+        Get the worst-case distribution for fixed-route mode.
+        Since for the fixed-route mode, the travel distance is sunk, the operating cost on the provider is fixed.
+        The costs we need to consider are the costs on the riders, which include wait time, transit time, and walk time.
+        Given that wait time and trainsit time are both solely dependent on the routes, they are also sunk.
+        Therefore, the only cost we need to consider is the walk time, which is dependent on the distribution of the riders.
+        The worst-case distribution is the one that maximizes the walk time, within the Wasserstein ball centered at the true distribution.
+
+        param prob_dict: dict
+            A dictionary that maps the node index to the underlying true probability mass.
+            The keys are the node indices, and the values are the probability masses.
+        """
+        nearest_stop = self.routedata.find_nearest_stops()
+        node_list = self.geodata.short_geoid_list
+
+        model = gp.model()
+
+        prob_mass = model.addVars(node_list, lb=0.0, vtype=GRB.CONTINUOUS, name="prob_mass")
+        transport_plan = model.addVars(node_list, node_list, lb=0.0, vtype=GRB.CONTINUOUS, name="transport_plan")
+        # Objective: maximize the total walk time
+        walk_time_dict = {node: nearest_stop[node]["distance"] / 1.4 for node in node_list}
+        model.setObjective(gp.quicksum(prob_mass[node] * walk_time_dict[node] for node in node_list), GRB.MAXIMIZE)
+
+        # Constraints
+        model.addConstr(prob_mass.sum() == 1, "total_prob_mass")
+        model.addConstrs(gp.quicksum(transport_plan[node1, node2] for node2 in node_list) == prob_dict[node1] for node1 in node_list)
+        model.addConstrs(gp.quicksum(transport_plan[node1, node2] for node1 in node_list) == prob_mass[node2] for node2 in node_list)
+
+        # Wasserstein distance constraint
+        model.addConstr(gp.quicksum(transport_plan[node1, node2] * self.geodata.get_dist(node1, node2) 
+                                    for node1 in node_list for node2 in node_list) <= self.epsilon, "wasserstein_distance")
+        
+        model.setParam('OutputFlag', 0)
+        model.optimize()
+
+        if model.status == GRB.OPTIMAL:
+            # Extract the optimal solution
+            prob_mass_solution = {node: prob_mass[node].X for node in node_list}
+            transport_plan_solution = {(node1, node2): transport_plan[node1, node2].X for node1 in node_list for node2 in node_list}
+            return prob_mass_solution, transport_plan_solution
+        else:
+            raise Exception("Model did not find an optimal solution.")
+
 
 
     def evaluate_fixed_route(self, prob_dict):
@@ -64,8 +119,7 @@ class Evaluate:
             3) Transit time, expected transit time from the stop to the destination on the shuttle
         For the provider, the cost is
             1) Travel cost, the long-run average cost of the shuttle operting on a district
-        """
-        """
+
         Calculate walk, wait, and transit times for fixed-route mode.
         Returns a dict with detailed and expected metrics.
         """
@@ -154,7 +208,7 @@ class Evaluate:
             results_dict = self.evaluate_fixed_route(prob_dict)
             return results_dict
         elif mode == "tsp":
-            pass
+            raise NotImplementedError("TSP mode is not implemented yet.")
         
 
 

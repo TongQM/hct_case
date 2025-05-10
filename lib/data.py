@@ -266,26 +266,52 @@ class RouteData:
         plt.show()
         
         return stops_dict
+    
+    def find_nearest_stops(self):
+        """
+        For each node in self.gdf, find the nearest stop among all routes in self.routes_info.
+        Returns:
+            dict: node_idx -> {
+                'route': <route Description string>,
+                'stop': <original stop dict>,
+                'distance': <distance in meters>
+            }
+        """
+        nearest = {}
+        # pre‐project all stops once
+        all_stops = []
+        for route in self.routes_info:
+            route_name = route.get("Description", f"Route {route.get('RouteID')}")
+            for stop in route.get("Stops", []):
+                pt = Point(stop["Longitude"], stop["Latitude"])
+                proj = self.project_geometry(pt)
+                all_stops.append((route_name, stop, proj))
+
+        # now loop over every node
+        for idx, row in self.gdf.iterrows():
+            cent = row.geometry.centroid
+            best = None
+            best_dist = float("inf")
+            for route_name, stop_dict, stop_pt in all_stops:
+                d = cent.distance(stop_pt)
+                if d < best_dist:
+                    best_dist = d
+                    best = (route_name, stop_dict)
+            nearest[idx] = {
+                "route": best[0],
+                "stop": best[1],
+                "distance": best_dist
+            }
+        return nearest
 
 
     def _get_fixed_route_assignment(self, visualize=True):
         """
         Partition nodes into Districts based on the nearest stop, then plot with proper legend.
         """
-        # Assign each block group to nearest route
-        district_assignment = {}
-        for idx, row in self.gdf.iterrows():
-            centroid = row.geometry.centroid
-            best_route, best_dist = None, float('inf')
-            for route in self.routes_info:
-                name = route.get("Description", f"Route {route.get('RouteID')}")
-                for stop in route.get("Stops", []):
-                    pt = Point(stop['Longitude'], stop['Latitude'])
-                    pt_proj = self.project_geometry(pt)
-                    d = centroid.distance(pt_proj)
-                    if d < best_dist:
-                        best_dist, best_route = d, name
-            district_assignment[idx] = best_route
+        # Assign each node to nearest route
+        nearest_stops = self.find_nearest_stops()
+        district_assignment = {idx: nearest_stops[idx]['route'] for idx in self.gdf.index}
         self.gdf['district'] = self.gdf.index.map(district_assignment)
 
         # Find center of each district
