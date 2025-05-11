@@ -9,7 +9,7 @@ import networkx as nx
 import pandas as pd
 from libpysal.weights import Queen
 import polyline
-import json
+import simpy
 from shapely.geometry import LineString, Point
 from shapely.ops import transform
 from pyproj import Transformer
@@ -108,8 +108,172 @@ class Evaluate:
         else:
             raise Exception("Model did not find an optimal solution.")
 
+    def simulate_wait_and_transit_fixed_route(self, prob_dict, n_sims=10000, dest_name="Walmart (Garden Center)"):
+        """
+        Already replaced by simulate_wait_and_transit_fixed_route_simpy.
 
-    def evaluate_fixed_route(self, prob_dict):
+        Simulate rider wait and transit times under fixed-route service mode using uniformly random bus locations.
+
+        Assumes each rider travels from their home node, boards at the nearest stop,
+        and all riders unboard at the specified destination stop.
+
+        Parameters
+        ----------
+        prob_dict : dict
+            A dictionary that maps the node index to the true or worst probability mass.
+        n_sims : int
+            Number of riders to simulate.
+        dest_name : str
+            Name of the common destination stop.
+
+        Returns
+        -------
+        wait_times : np.ndarray
+            Simulated wait times (seconds) for each rider.
+        transit_times : np.ndarray
+            Simulated in-vehicle transit times (seconds) for each rider.
+        """
+        # 1) Get nearest stop info per node
+        nearest = self.routedata.find_nearest_stops()  # node -> {'route', 'stop', 'distance'}
+
+        # 2) Build sampling distribution
+        nodes = list(nearest.keys())
+        probs = np.array([prob_dict.get(n, 0.0) for n in nodes])
+        probs = probs / probs.sum()
+
+        # 3) Sample riders
+        sampled = np.random.choice(nodes, size=n_sims, p=probs)
+        wait_times = np.zeros(n_sims)
+        transit_times = np.zeros(n_sims)
+
+        # 4) Simulate each rider
+        for i, node in enumerate(sampled):
+            info = nearest[node]
+            route_name = info['route']
+            boarding_stop = info['stop']
+
+            # Find route and its stop sequence
+            for route in self.routedata.routes_info:
+                if route.get("Description", f"Route {route.get('RouteID')}") == route_name:
+                    stops = route.get("Stops", [])
+                    # extract segment times and names
+                    secs = [s.get("SecondsToNextStop", 0) for s in stops]
+                    names = [s.get("Description", "") for s in stops]
+
+                    # indices
+                    board_idx = next(idx for idx, s in enumerate(stops) if s == boarding_stop)
+                    dest_idx = names.index(dest_name) if dest_name in names else None
+
+                    # 4a) Wait: uniform on headway
+                    headway = sum(secs)
+                    wait_times[i] = np.random.rand() * headway
+
+                    # 4b) Transit: sum travel times from boarding to destination
+                    if dest_idx is None:
+                        transit_times[i] = np.nan
+                    else:
+                        if dest_idx >= board_idx:
+                            transit_times[i] = sum(secs[board_idx:dest_idx])
+                        else:
+                            transit_times[i] = sum(secs[board_idx:]) + sum(secs[:dest_idx])
+                    break
+
+        return wait_times, transit_times
+
+
+    def simulate_wait_and_transit_fixed_route_simpy(self, prob_dict, sim_time=3600, dest_name='Walmart (Garden Center)'):
+        """
+        Simulate buses and Poisson rider arrivals using SimPy.
+
+        Returns wait and transit summaries per route:
+            wait_summary   : {route: (mass_assigned, avg_wait_seconds)}
+            transit_summary: {route: (mass_assigned, avg_transit_seconds)}
+        """
+        # 0) Create simulation environment
+        env = simpy.Environment()
+
+        # 1) Find nearest stop for each node
+        nearest = self.routedata.find_nearest_stops()
+
+        # 2) Initialize stores and mass per route
+        routes = self.routedata.routes_info
+        stop_map = {}
+        mass_per_route = {}
+        for route in routes:
+            rname = route.get('Description', f"Route {route.get('RouteID')}")
+            mass_per_route[rname] = 0.0
+            for i, s in enumerate(route.get('Stops', [])):
+                stop_map[(rname, i)] = simpy.Store(env)
+
+        # 3) Compute arrival rates and assign masses
+        arrivals = {}
+        for node, info in nearest.items():
+            r = info['route']
+            sdict = info['stop']
+            seq = next(rt.get('Stops', []) for rt in routes if rt.get('Description') == r)
+            idx = next(i for i, x in enumerate(seq) if x == sdict)
+            mass = prob_dict.get(node, 0)
+            mass_per_route[r] += mass
+            arrivals[(r, idx)] = arrivals.get((r, idx), 0) + mass
+        # Normalize rates so sum equals total_mass per hour
+        total_mass = sum(prob_dict.values())
+        for key in arrivals:
+            arrivals[key] = arrivals[key]  # keep mass as relative rate
+
+        # 4) Define processes
+        wait_records = {r: [] for r in mass_per_route}
+        transit_records = {r: [] for r in mass_per_route}
+
+        def rider_gen(route, idx, rate, store):
+            while True:
+                # Poisson interarrival
+                yield env.timeout(np.random.exponential(1.0 / rate))
+                store.put({'time': env.now, 'route': route, 'stop_idx': idx})
+
+        def bus_proc(route):
+            stops = next(rt.get('Stops') for rt in routes if rt.get('Description') == route)
+            secs = [s.get('SecondsToNextStop', 0) for s in stops]
+            names = [s.get('Description', '') for s in stops]
+            dest_idx = next((i for i, nm in enumerate(names) if nm == dest_name), None)
+            i = 0
+            while env.now < sim_time:
+                store = stop_map[(route, i)]
+                # discharge riders
+                while store.items:
+                    rider = yield store.get()
+                    wait = env.now - rider['time']
+                    wait_records[route].append(wait)
+                    # compute transit
+                    if dest_idx is not None:
+                        if dest_idx >= i:
+                            ttime = sum(secs[i:dest_idx])
+                        else:
+                            ttime = sum(secs[i:]) + sum(secs[:dest_idx])
+                        transit_records[route].append(ttime)
+                # move to next
+                yield env.timeout(secs[i])
+                i = (i + 1) % len(stops)
+
+        # 5) Start processes
+        for (r, idx), rate in arrivals.items():
+            if rate > 0:
+                env.process(rider_gen(r, idx, rate, stop_map[(r, idx)]))
+        for r in mass_per_route:
+            env.process(bus_proc(r))
+
+        # 6) Run simulation
+        env.run(until=sim_time)
+
+        # 7) Summarize
+        wait_summary = {r: (mass_per_route[r], np.mean(wait_records[r]) if wait_records[r] else 0)
+                        for r in mass_per_route}
+        transit_summary = {r: (mass_per_route[r], np.mean(transit_records[r]) if transit_records[r] else 0)
+                           for r in mass_per_route}
+        return wait_summary, transit_summary
+
+
+
+    def evaluate_fixed_route(self, prob_dict, simulate=True):
         """
         Evalaute the costs incurred by riders and the provider using fixed-route mode.
         For riders, the costs include
@@ -163,29 +327,49 @@ class Evaluate:
         expected_walk_time = expected_walk_distance / walking_speed
         walk_time_detail = {r: walk_distance[r]/walking_speed for r in walk_distance}
 
-        # 4) Wait time: assume uniform arrival, average wait = half cycle time
-        wait_time = {r: travel_times[r]/2.0 for r in travel_times}
-        # group-level probability for each route
-        district_probs = {
-            r: sum(prob.get(idx, 0) for idx in self.geodata.gdf[self.geodata.gdf['district']==r].index)
-            for r in wait_time
-        }
-        expected_wait_time = sum(wait_time[r]*district_probs[r] for r in wait_time)
 
-        # 5) Transit time: assume average ride = half total travel time
-        transit_time = {r: travel_times[r]/2.0 for r in travel_times}
-        expected_transit_time = sum(transit_time[r]*district_probs[r] for r in transit_time)
+        if simulate:
+            # 4) Simulate wait and transit times
+            wait_times, transit_times = self.simulate_wait_and_transit_fixed_route_simpy(prob_dict)
+            expected_wait_time = np.sum([wait_times[rt][0] * wait_times[rt][1] for rt in wait_times])
+            expected_transit_time = np.sum([transit_times[rt][0] * transit_times[rt][1] for rt in transit_times])
 
-        return {
-            'route_lengths': route_lengths,
-            'travel_times': travel_times,
-            'walk_time_detail': walk_time_detail,
-            'expected_walk_time': expected_walk_time,
-            'wait_time_detail': wait_time,
-            'expected_wait_time': expected_wait_time,
-            'transit_time_detail': transit_time,
-            'expected_transit_time': expected_transit_time
-        }
+            return {
+                'route_lengths': route_lengths,
+                'travel_times': travel_times,
+                'walk_time_detail': walk_time_detail,
+                'expected_walk_time': expected_walk_time,
+                'wait_time_detail': wait_times,
+                'expected_wait_time': expected_wait_time,
+                'transit_time_detail': transit_times,
+                'expected_transit_time': expected_transit_time
+            }
+
+        
+        else:
+            # 4) Wait time: assume uniform arrival, average wait = half cycle time
+            wait_time = {r: travel_times[r]/2.0 for r in travel_times}
+            # group-level probability for each route
+            district_probs = {
+                r: sum(prob.get(idx, 0) for idx in self.geodata.gdf[self.geodata.gdf['district']==r].index)
+                for r in wait_time
+            }
+            expected_wait_time = sum(wait_time[r]*district_probs[r] for r in wait_time)
+
+            # 5) Transit time: assume average ride = half total travel time
+            transit_time = {r: travel_times[r]/2.0 for r in travel_times}
+            expected_transit_time = sum(transit_time[r]*district_probs[r] for r in transit_time)
+
+            return {
+                'route_lengths': route_lengths,
+                'travel_times': travel_times,
+                'walk_time_detail': walk_time_detail,
+                'expected_walk_time': expected_walk_time,
+                'wait_time_detail': wait_time,
+                'expected_wait_time': expected_wait_time,
+                'transit_time_detail': transit_time,
+                'expected_transit_time': expected_transit_time
+            }
 
         
 
