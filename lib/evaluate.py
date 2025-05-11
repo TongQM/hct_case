@@ -64,7 +64,7 @@ class Evaluate:
         self.epsilon = epsilon
 
 
-    def _get_fixed_route_worst_distribution(self, prob_dict):
+    def get_fixed_route_worst_distribution(self, prob_dict):
         """
         Get the worst-case distribution for fixed-route mode.
         Since for the fixed-route mode, the travel distance is sunk, the operating cost on the provider is fixed.
@@ -107,6 +107,50 @@ class Evaluate:
             return prob_mass_solution, transport_plan_solution
         else:
             raise Exception("Model did not find an optimal solution.")
+        
+
+    def find_worst_walk_node(self, dest_name='Walmart (Garden Center)'):
+        """
+        Identify the node with the maximal walk distance to its nearest stop,
+        and compute its expected wait (headway/2) and transit time to the destination.
+
+        Returns:
+            dict with keys:
+              'node', 'walk_distance', 'route', 'wait_time', 'transit_time'
+        """
+        nearest = self.routedata.find_nearest_stops()
+        # Worst node by walk distance
+        worst = max(nearest, key=lambda n: nearest[n]['distance'])
+        info = nearest[worst]
+        walk_dist = info['distance']
+        route_name = info['route']
+        boarding_stop = info['stop']
+        # Retrieve route stops
+        route = next(rt for rt in self.routedata.routes_info
+                     if rt.get('Description', f"Route {rt.get('RouteID')}") == route_name)
+        stops = route.get('Stops', [])
+        secs = [s.get('SecondsToNextStop', 0) for s in stops]
+        names = [s.get('Description', '') for s in stops]
+        headway = sum(secs)
+        wait_time = headway / 2.0
+        # Find indices
+        board_idx = next(i for i, s in enumerate(stops) if s == boarding_stop)
+        dest_idx = next((i for i, nm in enumerate(names) if dest_name in nm), None)
+        if dest_idx is None:
+            transit_time = None
+        else:
+            if dest_idx >= board_idx:
+                transit_time = sum(secs[board_idx:dest_idx])
+            else:
+                transit_time = sum(secs[board_idx:]) + sum(secs[:dest_idx])
+        return {
+            'node': worst,
+            'walk_distance': walk_dist,
+            'route': route_name,
+            'wait_time': wait_time,
+            'transit_time': transit_time
+        }
+
 
     def simulate_wait_and_transit_fixed_route(self, prob_dict, n_sims=10000, dest_name="Walmart (Garden Center)"):
         """
@@ -330,7 +374,7 @@ class Evaluate:
 
         if simulate:
             # 4) Simulate wait and transit times
-            wait_times, transit_times = self.simulate_wait_and_transit_fixed_route_simpy(prob_dict)
+            wait_times, transit_times = self.simulate_wait_and_transit_fixed_route_simpy(prob_dict, sim_time=43200)
             expected_wait_time = np.sum([wait_times[rt][0] * wait_times[rt][1] for rt in wait_times])
             expected_transit_time = np.sum([transit_times[rt][0] * transit_times[rt][1] for rt in transit_times])
 
