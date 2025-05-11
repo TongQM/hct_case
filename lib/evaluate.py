@@ -73,14 +73,14 @@ class Evaluate:
         Therefore, the only cost we need to consider is the walk time, which is dependent on the distribution of the riders.
         The worst-case distribution is the one that maximizes the walk time, within the Wasserstein ball centered at the true distribution.
 
-        param prob_dict: dict
+        :param prob_dict: dict
             A dictionary that maps the node index to the underlying true probability mass.
             The keys are the node indices, and the values are the probability masses.
         """
         nearest_stop = self.routedata.find_nearest_stops()
         node_list = self.geodata.short_geoid_list
 
-        model = gp.model()
+        model = gp.Model("fixed_route_worst_distribution")
 
         prob_mass = model.addVars(node_list, lb=0.0, vtype=GRB.CONTINUOUS, name="prob_mass")
         transport_plan = model.addVars(node_list, node_list, lb=0.0, vtype=GRB.CONTINUOUS, name="transport_plan")
@@ -107,7 +107,6 @@ class Evaluate:
             return prob_mass_solution, transport_plan_solution
         else:
             raise Exception("Model did not find an optimal solution.")
-
 
 
     def evaluate_fixed_route(self, prob_dict):
@@ -209,10 +208,4 @@ class Evaluate:
             return results_dict
         elif mode == "tsp":
             raise NotImplementedError("TSP mode is not implemented yet.")
-        
-
-
-
-
-
         
