@@ -1,19 +1,10 @@
-import geopandas as gpd
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
 import math
-import matplotlib.pyplot as plt
-import matplotlib.cm as cm
-import matplotlib.patches as mpatches
-import networkx as nx
-import pandas as pd
-from libpysal.weights import Queen
 import polyline
 import simpy
 from shapely.geometry import LineString, Point
-from shapely.ops import transform
-from pyproj import Transformer
 
 from lib.data import GeoData, RouteData
 
@@ -492,15 +483,16 @@ class Evaluate:
 
         # Integrate the probability mass on the district
         district_prob = np.sum([prob_dict[node_list[i]] * node_assignment[i, district_idx] for i in range(n)])
+        district_arrival_rate = overall_arrival_rate * district_prob
         # Integrate the square root of the probability mass on the district, we use the vanilla implementation which can be optimized via
         # the optimal objective value obatined from get_tsp_worst_distributions
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
         # Get the optimal dispatch interval
         beta = 2287 / (math.sqrt(214) * 210)
-        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(overall_arrival_rate) * district_prob)) ** (2/3)
+        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(district_arrival_rate) * district_prob)) ** (2/3)
 
-        mean_wait_time_per_interval = overall_arrival_rate * interval**2 / 2 * district_prob
-        mean_transit_distance_per_interval = beta * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
+        mean_wait_time_per_interval = district_arrival_rate * interval**2 / 2 * district_prob
+        mean_transit_distance_per_interval = beta * math.sqrt(district_arrival_rate * interval) * district_prob_sqrt
 
         amt_wait_time = mean_wait_time_per_interval / interval
         amt_transit_distance = mean_transit_distance_per_interval / interval
@@ -508,6 +500,7 @@ class Evaluate:
         results_dict = {
             'district_center': center,
             'district_prob': district_prob,
+            'dispatch_interval': interval,
             'district_prob_sqrt': district_prob_sqrt,
             'mean_wait_time_per_interval': mean_wait_time_per_interval,
             'mean_transit_distance_per_interval': mean_transit_distance_per_interval,
@@ -517,7 +510,7 @@ class Evaluate:
 
         return results_dict
 
-    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list):
+    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list, unit_wait_cost=1.0, overall_arrival_rate=1000):
         """
         Evaluate the costs incurred by riders and the provider using TSP mode.
         For riders, the costs include
@@ -536,13 +529,13 @@ class Evaluate:
             # Get the worst-case distribution for TSP mode
             prob_dict = worst_probability_dict_dict[center]
             # Evaluate the costs incurred by riders and the provider using TSP mode
-            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center)
+            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center, unit_wait_cost, overall_arrival_rate)
 
         return results_dict
 
 
 
-    def evaluate(self, node_assignment, center_list, prob_dict, mode="fixed"):
+    def evaluate(self, node_assignment, center_list, prob_dict, mode="fixed", unit_wait_cost=None, overall_arrival_rate=None):
         """
         Evaluate the costs incurred by different entities using different partitions plus operations.
         We will compare the costs on the riders and the costs on the provider.
@@ -560,6 +553,8 @@ class Evaluate:
             results_dict = self.evaluate_fixed_route(prob_dict)
             return results_dict
         elif mode == "tsp":
+            assert unit_wait_cost is not None, "unit_wait_cost must not be None"
+            assert overall_arrival_rate is not None, "overall_arrival_rate must not be None"
             results_dict = self.evaluate_tsp_mode(prob_dict, node_assignment, center_list)
             return results_dict
         
