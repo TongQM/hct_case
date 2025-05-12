@@ -489,10 +489,10 @@ class Evaluate:
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
         # Get the optimal dispatch interval
         beta = 2287 / (math.sqrt(214) * 210)
-        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(district_arrival_rate) * district_prob)) ** (2/3)
+        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(overall_arrival_rate) * district_prob)) ** (2/3)
 
-        mean_wait_time_per_interval = district_arrival_rate * interval**2 / 2 * district_prob
-        mean_transit_distance_per_interval = beta * math.sqrt(district_arrival_rate * interval) * district_prob_sqrt
+        mean_wait_time_per_interval = overall_arrival_rate * interval**2 / 2 * district_prob
+        mean_transit_distance_per_interval = beta * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
 
         amt_wait_time = mean_wait_time_per_interval / interval
         amt_transit_distance = mean_transit_distance_per_interval / interval
