@@ -153,8 +153,8 @@ class GeoData:
         gdf['district'] = district_labels
 
         # Create the plot with a categorical colormap.
-        fig, ax = plt.subplots(figsize=(10, 10))
-        gdf.plot(column='district', cmap='tab20', legend=True, ax=ax)
+        fig, ax = plt.subplots(figsize=(15, 15))
+        gdf.plot(column='district', cmap='tab20', legend=False, ax=ax)
         
         centers = {}
         # For each district, determine the center block group.

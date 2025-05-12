@@ -2,6 +2,7 @@ import geopandas as gpd
 import numpy as np
 import gurobipy as gp
 from gurobipy import GRB
+import math
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 import matplotlib.patches as mpatches
@@ -63,6 +64,10 @@ class Evaluate:
         self.short_geoid_list = geodata.short_geoid_list
         self.epsilon = epsilon
 
+
+    # ==========================================================
+    # Fixed-route related methods
+    # ==========================================================
 
     def get_fixed_route_worst_distribution(self, prob_dict):
         """
@@ -415,7 +420,127 @@ class Evaluate:
                 'expected_transit_time': expected_transit_time
             }
 
-        
+    # ==========================================================
+    # Doorstep pickup (TSP) related methods
+    # ==========================================================
+
+
+    def get_tsp_worst_distributions(self, prob_dict, center_list, node_assignment):
+        """
+        Get the worst-case distributions for TSP mode on each district.
+        The costs we need to consider include the costs on the riders: wait time and transit time; and the costs on the provider: travel cost.
+        The worst-case distribution is the one that maximizes the overall, within the Wasserstein ball centered at the estimated empirical distribution.
+
+        :param prob_dict: dict
+            A dictionary that maps the node index to the estimated empirical true probability mass.
+            The keys are the node indices, and the values are the probability masses.
+        """
+        node_list = self.short_geoid_list
+        n = len(node_list)
+        probability_dict_dict = {}
+
+        for center in center_list:
+            district_idx = center_list.index(center)
+
+            model = gp.Model("inner_problem_lower_bound")
+            # Add variables
+            x = model.addVars(node_list, lb=0.0, name="x")
+            y = model.addVars(node_list, node_list, lb=0.0, name='y')
+
+            # Set objective: maximize sum of x_i
+            model.setObjective(gp.quicksum(x[node_list[i]] * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)), GRB.MAXIMIZE)
+
+            # Add quadratic constraint: sum of squares of x_i <= 1
+            model.addQConstr(gp.quicksum(x[node] * x[node] for node in node_list) <= 1, name="quad_constraint")
+            model.addConstrs((gp.quicksum(y[node1, node2] for node2 in node_list) == prob_dict[node1] for node1 in node_list), name='y_sum')
+            for node2 in node_list:
+                model.addQConstr((gp.quicksum(y[node1, node2] for node1 in node_list) >= x[node2] * x[node2]), name='y_sumj')
+
+            model.addConstr(gp.quicksum(self.geodata.get_dist(node1, node2) * y[node1, node2] for node1 in node_list for node2 in node_list) <= self.epsilon, name='wasserstein')
+            # Optimize model
+            model.setParam('OutputFlag', 0)
+            model.optimize()
+
+
+            if model.status == GRB.OPTIMAL:
+                # Extract the optimal solution
+                prob_mass_solution = {node: (x[node].X)**2 for node in node_list}
+                # transport_plan_solution = {(node1, node2): y[node1, node2].X for node1 in node_list for node2 in node_list}
+                probability_dict_dict[center] = prob_mass_solution
+
+            else:
+                raise Exception("Model did not find an optimal solution.")
+
+        return probability_dict_dict
+
+    def evaluate_tsp_mode_on_single_district(self, prob_dict, node_assignment, center_list, center, unit_wait_cost=1.0, overall_arrival_rate=1000):
+        """
+        Evaluate the costs incurred by riders and the provider using TSP mode on a single district
+        with its corresponding worst-case distribution dict.
+        For riders, the costs include
+            1) Wait time, expected wait time at home until the shuttle arrives
+            2) Transit time, expected transit time from home to the destination on the shuttle
+        For the provider, the cost is
+            1) Travel cost, the long-run average cost of the shuttle operting on a district
+
+        Calculate wait and transit times for TSP mode.
+        Returns a dict with detailed and expected metrics.
+        """
+        node_list = self.short_geoid_list
+        n = len(node_list)
+        district_idx = center_list.index(center)
+
+        # Integrate the probability mass on the district
+        district_prob = np.sum([prob_dict[node_list[i]] * node_assignment[i, district_idx] for i in range(n)])
+        # Integrate the square root of the probability mass on the district, we use the vanilla implementation which can be optimized via
+        # the optimal objective value obatined from get_tsp_worst_distributions
+        district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
+        # Get the optimal dispatch interval
+        beta = 2287 / (math.sqrt(214) * 210)
+        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(overall_arrival_rate) * district_prob)) ** (2/3)
+
+        mean_wait_time_per_interval = overall_arrival_rate * interval**2 / 2 * district_prob
+        mean_transit_distance_per_interval = beta * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
+
+        amt_wait_time = mean_wait_time_per_interval / interval
+        amt_transit_distance = mean_transit_distance_per_interval / interval
+
+        results_dict = {
+            'district_center': center,
+            'district_prob': district_prob,
+            'district_prob_sqrt': district_prob_sqrt,
+            'mean_wait_time_per_interval': mean_wait_time_per_interval,
+            'mean_transit_distance_per_interval': mean_transit_distance_per_interval,
+            'amt_wait_time': amt_wait_time,
+            'amt_transit_distance': amt_transit_distance,
+        }
+
+        return results_dict
+
+    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list):
+        """
+        Evaluate the costs incurred by riders and the provider using TSP mode.
+        For riders, the costs include
+            1) Wait time, expected wait time at home until the shuttle arrives
+            2) Transit time, expected transit time from home to the destination on the shuttle
+        For the provider, the cost is
+            1) Travel cost, the long-run average cost of the shuttle operting on a district
+
+        Calculate wait and transit times for TSP mode.
+        Returns a dict with detailed and expected metrics.
+        """
+        worst_probability_dict_dict = self.get_tsp_worst_distributions(prob_dict, center_list, node_assignment)
+        results_dict = {}
+
+        for center in center_list:
+            # Get the worst-case distribution for TSP mode
+            prob_dict = worst_probability_dict_dict[center]
+            # Evaluate the costs incurred by riders and the provider using TSP mode
+            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center)
+
+        return results_dict
+
+
 
     def evaluate(self, node_assignment, center_list, prob_dict, mode="fixed"):
         """
@@ -435,5 +560,6 @@ class Evaluate:
             results_dict = self.evaluate_fixed_route(prob_dict)
             return results_dict
         elif mode == "tsp":
-            raise NotImplementedError("TSP mode is not implemented yet.")
+            results_dict = self.evaluate_tsp_mode(prob_dict, node_assignment, center_list)
+            return results_dict
         
