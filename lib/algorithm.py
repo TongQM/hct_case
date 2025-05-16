@@ -161,9 +161,12 @@ class Partition:
 
             # Calculate the lower bound of the objective value for all districts and the worst district
             obj_dict_lb = self._SDP(block_assignment, block_centers)
-            district_lb_costs = [obj_dict_lb[center]['bhh']**2 * obj_dict_lb[center]['district_mass'] for center in block_centers]
-            worst_district_lb = max(obj_dict_lb.items(), key=lambda x: x[1]['bhh']**2 * x[1]['district_mass'])
-            worst_district_cost_lb = worst_district_lb[1]['bhh']**2 * worst_district_lb[1]['district_mass']
+            # district_lb_costs = [obj_dict_lb[center]['bhh']**2 * obj_dict_lb[center]['district_mass'] for center in block_centers]
+            # worst_district_lb = max(obj_dict_lb.items(), key=lambda x: x[1]['bhh']**2 * x[1]['district_mass'])
+            # worst_district_cost_lb = worst_district_lb[1]['bhh']**2 * worst_district_lb[1]['district_mass']
+            district_lb_costs = [obj_dict_lb[center]['bhh'] for center in block_centers]
+            worst_district_lb = max(obj_dict_lb.items(), key=lambda x: x[1]['bhh'])
+            worst_district_cost_lb = worst_district_lb[1]['bhh']
 
             # Calculate the upper bound of the objective value for all districts and the worst district
             obj_dict_ub = self._LP(block_assignment, block_centers)
@@ -171,7 +174,7 @@ class Partition:
             worst_district_ub = max(obj_dict_ub.items(), key=lambda x: x[1]['bhh']**2 * x[1]['district_area'])
             worst_district_cost_ub = worst_district_ub[1]['bhh']**2 * worst_district_ub[1]['district_area']
 
-            print(f"The gap between the lower and upper bound is {worst_district_cost_ub - worst_district_cost_lb}")
+            # print(f"The gap between the lower and upper bound is {worst_district_cost_ub - worst_district_cost_lb}")
             
             worst_district_list.append({'lb': (worst_district_lb, worst_district_cost_lb), 'ub': (worst_district_ub, worst_district_cost_ub)})
             district_costs_list.append({'lb': district_lb_costs, 'ub': district_ub_costs})
@@ -206,7 +209,7 @@ class Partition:
         assignment = self._Hess_model(block_centers)
         obj_dict = self._SDP(assignment, block_centers) if criterion == 'lb' else self._LP(assignment, block_centers)
         if criterion == 'lb':
-            obj_val_dict = {node: obj_dict[node]['bhh']**2 * obj_dict[node]['district_mass'] for node in obj_dict.keys()}
+            obj_val_dict = {node: obj_dict[node]['bhh'] for node in obj_dict.keys()}
             best_obj_val = max(obj_val_dict.values())
         elif criterion == 'ub':
             obj_val_dict = {node: obj_dict[node]['bhh']**2 * obj_dict[node]['district_area'] for node in obj_dict.keys()}
@@ -222,7 +225,7 @@ class Partition:
                     new_assignment = self._Hess_model(new_centers)
                     if criterion == 'lb':
                         new_obj_dict = self._SDP(new_assignment, new_centers)
-                        new_obj_val_dict = {node: new_obj_dict[node]['bhh']**2 * new_obj_dict[node]['district_mass'] for node in new_obj_dict.keys()}
+                        new_obj_val_dict = {node: new_obj_dict[node]['bhh'] for node in new_obj_dict.keys()}
                         new_obj_val = max(new_obj_val_dict.values())
                     elif criterion == 'ub':
                         new_obj_dict = self._LP(new_assignment, new_centers)

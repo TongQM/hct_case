@@ -464,7 +464,7 @@ class Evaluate:
 
         return probability_dict_dict
 
-    def evaluate_tsp_mode_on_single_district(self, prob_dict, node_assignment, center_list, center, unit_wait_cost=1.0, overall_arrival_rate=1000):
+    def evaluate_tsp_mode_on_single_district(self, prob_dict, node_assignment, center_list, center, unit_wait_cost=1.0, overall_arrival_rate=1000, max_dipatch_interval=24):
         """
         Evaluate the costs incurred by riders and the provider using TSP mode on a single district
         with its corresponding worst-case distribution dict.
@@ -489,12 +489,13 @@ class Evaluate:
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
         # Get the optimal dispatch interval
         beta = 2287 / (math.sqrt(214) * 210)
-        interval = ((beta * district_prob_sqrt) / (unit_wait_cost * math.sqrt(overall_arrival_rate) * district_prob)) ** (2/3)
+        interval = ((beta * district_prob_sqrt * math.sqrt(overall_arrival_rate)) / (unit_wait_cost)) ** (2/3)
+        interval = min(interval, max_dipatch_interval)
 
-        mean_wait_time_per_interval = overall_arrival_rate * interval**2 / 2 * district_prob
+        mean_wait_time_per_interval_per_rider = interval / 2
         mean_transit_distance_per_interval = beta * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
 
-        amt_wait_time = mean_wait_time_per_interval / interval
+        # amt_wait_time = mean_wait_time_per_interval_per_rider / interval
         amt_transit_distance = mean_transit_distance_per_interval / interval
 
         results_dict = {
@@ -502,15 +503,14 @@ class Evaluate:
             'district_prob': district_prob,
             'dispatch_interval': interval,
             'district_prob_sqrt': district_prob_sqrt,
-            'mean_wait_time_per_interval': mean_wait_time_per_interval,
+            'mean_wait_time_per_interval_per_rider': mean_wait_time_per_interval_per_rider,
             'mean_transit_distance_per_interval': mean_transit_distance_per_interval,
-            'amt_wait_time': amt_wait_time,
             'amt_transit_distance': amt_transit_distance,
         }
 
         return results_dict
 
-    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list, unit_wait_cost=1.0, overall_arrival_rate=1000):
+    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list, unit_wait_cost=1.0, overall_arrival_rate=1000, worst_case=True, max_dipatch_interval=24):
         """
         Evaluate the costs incurred by riders and the provider using TSP mode.
         For riders, the costs include
@@ -526,10 +526,11 @@ class Evaluate:
         results_dict = {}
 
         for center in center_list:
-            # Get the worst-case distribution for TSP mode
-            prob_dict = worst_probability_dict_dict[center]
+            if worst_case:
+                # Get the worst-case distribution for TSP mode
+                prob_dict = worst_probability_dict_dict[center]
             # Evaluate the costs incurred by riders and the provider using TSP mode
-            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center, unit_wait_cost, overall_arrival_rate)
+            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center, unit_wait_cost, overall_arrival_rate, max_dipatch_interval)
 
         return results_dict
 
@@ -555,6 +556,6 @@ class Evaluate:
         elif mode == "tsp":
             assert unit_wait_cost is not None, "unit_wait_cost must not be None"
             assert overall_arrival_rate is not None, "overall_arrival_rate must not be None"
-            results_dict = self.evaluate_tsp_mode(prob_dict, node_assignment, center_list)
+            results_dict = self.evaluate_tsp_mode(prob_dict, node_assignment, center_list, unit_wait_cost, overall_arrival_rate)
             return results_dict
         
