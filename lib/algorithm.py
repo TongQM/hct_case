@@ -37,7 +37,7 @@ class Partition:
         Hess_model.setParam('OutputFlag', 0)
         Hess_model.optimize()
 
-        block_assignment = np.array([[z[node, center].x for center in block_centers] for node in self.short_geoid_list])
+        block_assignment = np.array([[z[node, center].X for center in block_centers] for node in self.short_geoid_list])
         return block_assignment
 
 
@@ -60,7 +60,7 @@ class Partition:
             recenter_model.setParam('OutputFlag', 0)
             recenter_model.optimize()
 
-            new_center = blocks_in_district[np.argmax([center_x[i].x for i in blocks_in_district])]
+            new_center = blocks_in_district[np.argmax([center_x[i].X for i in blocks_in_district])]
             new_centers.append(new_center)
 
         return np.array(new_centers)
@@ -81,8 +81,12 @@ class Partition:
             x = model.addVars(node_list, lb=0.0, name="x")
             y = model.addVars(node_list, node_list, lb=0.0, name='y')
 
-            # Set objective: maximize sum of x_i
-            model.setObjective(gp.quicksum(x[node_list[i]] * math.sqrt(self.geodata.get_area(node_list[i])) * z[i, district_idx] for i in range(n)), GRB.MAXIMIZE)
+            # Fix: Ensure proper type conversion for math.sqrt by converting to float
+            area_values = []
+            for i in range(n):
+                area_val = self.geodata.get_area(node_list[i])
+                area_values.append(float(area_val))
+            model.setObjective(gp.quicksum(x[node_list[i]] * math.sqrt(area_values[i]) * z[i, district_idx] for i in range(n)), GRB.MAXIMIZE)
 
             # Add quadratic constraint: sum of squares of x_i <= 1
             model.addQConstr(gp.quicksum(x[node] * x[node] for node in node_list) <= 1, name="quad_constraint")
@@ -120,11 +124,11 @@ class Partition:
             # Set objective: maximize sum of x_i
             model.setObjective(gp.quicksum(x[node_list[i]] * z[i, district_idx] for i in range(n)), GRB.MAXIMIZE)
 
-            # Add quadratic constraint: sum of squares of x_i <= 1
-            model.addQConstr(x.sum() == 1, name="total_mass")
+            # Fix: Use addConstr instead of addQConstr for linear constraints
+            model.addConstr(gp.quicksum(x[node] for node in node_list) == 1, name="total_mass")
             model.addConstrs((gp.quicksum(y[node1, node2] for node2 in node_list) == self.prob_dict[node1] for node1 in node_list), name='y_sum')
             for node2 in node_list:
-                model.addQConstr((gp.quicksum(y[node1, node2] for node1 in node_list) == x[node2]), name='y_sumj')
+                model.addConstr((gp.quicksum(y[node1, node2] for node1 in node_list) == x[node2]), name='y_sumj')
 
             model.addConstr(gp.quicksum(self.geodata.get_dist(node1, node2) * y[node1, node2] for node1 in node_list for node2 in node_list) <= self.epsilon, name='wasserstein')
             # Optimize model
