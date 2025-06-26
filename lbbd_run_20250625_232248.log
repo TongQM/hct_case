@@ -1,0 +1,47 @@
+2025-06-25 23:22:48,924 - INFO - Starting automated LBBD execution
+2025-06-25 23:22:48,925 - INFO - Log file: lbbd_run_20250625_232248.log
+2025-06-25 23:22:48,925 - INFO - Loading data...
+2025-06-25 23:22:48,925 - INFO - Loading block group demand data...
+2025-06-25 23:22:48,925 - WARNING - Commuting file not found: 2023_target_tract_commuting/ACSDT5Y2023.B08303-Data.csv
+2025-06-25 23:22:48,926 - INFO - Created demand data for 130 block groups
+2025-06-25 23:22:48,926 - INFO - Setting up GeoData...
+2025-06-25 23:22:49,444 - INFO - Built arc structures: 710 directed arcs for 130 nodes
+2025-06-25 23:22:49,444 - INFO - GeoData initialized with 130 block groups
+2025-06-25 23:22:49,444 - INFO - Creating probability dictionary...
+2025-06-25 23:22:49,444 - INFO - Created probability dict with total probability: 1.0000
+2025-06-25 23:22:49,444 - INFO - 
+============================================================
+2025-06-25 23:22:49,444 - INFO - Running experiment 1/1: tiny_test
+2025-06-25 23:22:49,444 - INFO - ============================================================
+2025-06-25 23:22:49,444 - INFO - Starting LBBD experiment: tiny_test
+2025-06-25 23:22:49,445 - INFO - Config: Tiny test with just 6 blocks for debugging
+2025-06-25 23:22:49,448 - INFO - Set parameter Username
+2025-06-25 23:22:49,454 - INFO - Academic license - for non-commercial use only - expires 2025-09-20
+2025-06-25 23:22:51,702 - WARNING - GeoData missing get_K for block 4980001, using K_i=1.0
+2025-06-25 23:22:51,703 - WARNING - GeoData missing get_F for block 4980001, using F_i=1.0
+2025-06-25 23:22:51,703 - INFO - SDP district root 4980001: cost=12.1471, alpha=11.2174, T*=3.1586
+2025-06-25 23:22:52,122 - WARNING - GeoData missing get_K for block 5647003, using K_i=1.0
+2025-06-25 23:22:52,122 - WARNING - GeoData missing get_F for block 5647003, using F_i=1.0
+2025-06-25 23:22:52,122 - INFO - SDP district root 5647003: cost=3.1540, alpha=0.2803, T*=1.5798
+2025-06-25 23:22:54,468 - WARNING - GeoData missing get_K for block 4980001, using K_i=1.0
+2025-06-25 23:22:54,468 - WARNING - GeoData missing get_F for block 4980001, using F_i=1.0
+2025-06-25 23:22:54,468 - INFO - SDP district root 4980001: cost=12.1767, alpha=11.2575, T*=3.1586
+2025-06-25 23:22:54,859 - WARNING - GeoData missing get_K for block 5647003, using K_i=1.0
+2025-06-25 23:22:54,859 - WARNING - GeoData missing get_F for block 5647003, using F_i=1.0
+2025-06-25 23:22:54,859 - INFO - SDP district root 5647003: cost=3.0579, alpha=0.1760, T*=1.5798
+2025-06-25 23:22:54,894 - INFO - LBBD completed in 5.45 seconds
+2025-06-25 23:22:54,894 - INFO - Best cost: 12.1471
+2025-06-25 23:22:54,894 - INFO - Converged in 2 iterations
+2025-06-25 23:22:54,899 - INFO - Results saved to lbbd_results/lbbd_tiny_test_20250625_232254.pkl and lbbd_results/lbbd_tiny_test_20250625_232254.json
+2025-06-25 23:22:54,900 - INFO - ✓ Experiment tiny_test completed successfully
+2025-06-25 23:22:54,900 - INFO -   Best cost: 12.1471
+2025-06-25 23:22:54,900 - INFO -   Runtime: 5.45s
+2025-06-25 23:22:54,900 - INFO -   Iterations: 2
+2025-06-25 23:22:54,900 - INFO -   Converged: True
+2025-06-25 23:22:54,902 - INFO - Combined results saved to lbbd_results/lbbd_combined_20250625_232254.pkl
+2025-06-25 23:22:54,902 - INFO - 
+============================================================
+2025-06-25 23:22:54,902 - INFO - FINAL SUMMARY
+2025-06-25 23:22:54,902 - INFO - ============================================================
+2025-06-25 23:22:54,902 - INFO - tiny_test       | Cost:  12.1471 | Time:   5.45s | Iter:   2 | Conv: Yes
+2025-06-25 23:22:54,902 - INFO - Automated LBBD execution completed successfully

@@ -1,0 +1,26 @@
+2025-06-25 21:45:23,756 - INFO - Starting automated LBBD execution
+2025-06-25 21:45:23,756 - INFO - Log file: lbbd_run_20250625_214523.log
+2025-06-25 21:45:23,757 - INFO - Loading data...
+2025-06-25 21:45:23,757 - INFO - Loading block group demand data...
+2025-06-25 21:45:23,757 - WARNING - Commuting file not found: 2023_target_tract_commuting/ACSDT5Y2023.B08303-Data.csv
+2025-06-25 21:45:23,758 - INFO - Created demand data for 130 block groups
+2025-06-25 21:45:23,758 - INFO - Setting up GeoData...
+2025-06-25 21:45:24,956 - INFO - Built arc structures: 710 directed arcs for 130 nodes
+2025-06-25 21:45:24,957 - INFO - GeoData initialized with 130 block groups
+2025-06-25 21:45:24,957 - INFO - Creating probability dictionary...
+2025-06-25 21:45:24,957 - INFO - Created probability dict with total probability: 1.0000
+2025-06-25 21:45:24,957 - INFO - 
+============================================================
+2025-06-25 21:45:24,957 - INFO - Running experiment 1/1: quick_test
+2025-06-25 21:45:24,957 - INFO - ============================================================
+2025-06-25 21:45:24,957 - INFO - Starting LBBD experiment: quick_test
+2025-06-25 21:45:24,957 - INFO - Config: Quick test with minimal iterations
+2025-06-25 21:45:24,960 - INFO - Set parameter Username
+2025-06-25 21:45:24,971 - INFO - Academic license - for non-commercial use only - expires 2025-09-20
+2025-06-25 21:45:34,775 - ERROR - Master problem failed to solve optimally. Status: 3
+2025-06-25 21:45:34,777 - ERROR - Master problem is infeasible
+2025-06-25 21:45:47,333 - ERROR - IIS written to file for debugging
+2025-06-25 21:45:47,335 - ERROR - No solution available
+2025-06-25 21:45:47,339 - ERROR - Error during LBBD execution: Master problem optimization failed with status 3
+2025-06-25 21:45:47,343 - ERROR - ✗ Experiment quick_test failed: Master problem optimization failed with status 3
+2025-06-25 21:45:47,548 - INFO - Automated LBBD execution completed successfully

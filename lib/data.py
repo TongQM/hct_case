@@ -11,6 +11,7 @@ import json
 from shapely.geometry import LineString, Point
 from shapely.ops import transform
 from pyproj import Transformer
+import logging
 
 
 class GeoData:
@@ -89,6 +90,42 @@ class GeoData:
         for src, paths in shortest_paths.items():
             for tgt, dist in paths.items():
                 self.shortest_distance_dict[(src, tgt)] = dist
+        
+        # Build directed arc list for flow-based constraints
+        self._build_arc_structures()
+
+    def _build_arc_structures(self):
+        """Build directed arc list and precompute in/out arc dictionaries for flow constraints"""
+        # Build directed arc list from undirected graph
+        self.arc_list = []
+        for u, v in self.G.edges():
+            self.arc_list.append((u, v))
+            self.arc_list.append((v, u))
+        self.arc_list = list(set(self.arc_list))  # Remove duplicates if any
+        
+        # Precompute out_arcs_dict and in_arcs_dict for all nodes
+        self.out_arcs_dict = {
+            node: [(node, neighbor) for neighbor in self.G.neighbors(node) if (node, neighbor) in self.arc_list] 
+            for node in self.short_geoid_list
+        }
+        self.in_arcs_dict = {
+            node: [(neighbor, node) for neighbor in self.G.neighbors(node) if (neighbor, node) in self.arc_list] 
+            for node in self.short_geoid_list
+        }
+        
+        logging.info(f"Built arc structures: {len(self.arc_list)} directed arcs for {len(self.short_geoid_list)} nodes")
+
+    def get_arc_list(self):
+        """Get the directed arc list"""
+        return self.arc_list
+    
+    def get_in_arcs(self, node):
+        """Get incoming arcs for a specific node"""
+        return self.in_arcs_dict.get(node, [])
+    
+    def get_out_arcs(self, node):
+        """Get outgoing arcs for a specific node"""
+        return self.out_arcs_dict.get(node, [])
 
     def get_area(self, bg_geoid):
         return self.gdf['area'][bg_geoid]
@@ -471,3 +508,17 @@ def load_data(meta_path, data_path):
     data.columns = data.columns.str.replace("!!", " ", regex=False)
     
     return data
+
+    def get_K(self, block):
+        if 'K' in self.gdf.columns:
+            return self.gdf.loc[block, 'K']
+        else:
+            logging.warning(f"K not found for block {block}, returning default 1.0")
+            return 0.0
+
+    def get_F(self, block):
+        if 'F' in self.gdf.columns:
+            return self.gdf.loc[block, 'F']
+        else:
+            logging.warning(f"F not found for block {block}, returning default 1.0")
+            return 0.0
