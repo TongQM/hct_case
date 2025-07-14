@@ -141,110 +141,96 @@ class Partition:
 
         return obj_dict
     
-    def random_search(self, max_iters=1000, criterion='lb'):
-        worst_district_list = []
-        district_costs_list = []
-        block_centers_list = []
-        best_obj_val_lb = float('inf')
-        best_obj_val_ub = float('inf')
-        best_block_centers = None
+    def _expand_assignment_matrix(self, block_assignment, block_centers):
+        """
+        Expand a (N_blocks, num_districts) assignment matrix to (N_blocks, N_blocks),
+        where columns corresponding to block_centers are filled, others are zero.
+        """
+        all_blocks = self.short_geoid_list
+        N = len(all_blocks)
+        num_districts = len(block_centers)
+        expanded = np.zeros((N, N))
+        center_idx_map = {center: all_blocks.index(center) for center in block_centers}
+        for j in range(N):
+            for d in range(num_districts):
+                expanded[j, center_idx_map[block_centers[d]]] = block_assignment[j, d]
+        return expanded
 
+    def random_search(self, max_iters=1000, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120):
+        """
+        Randomized search for the best partition using the real-problem objective.
+        Returns best_block_centers, best_assignment, best_obj_val, best_district_info
+        """
+        best_obj_val = float('inf')
+        best_block_centers = None
+        best_assignment = None
+        best_district_info = None
+        block_ids = self.short_geoid_list
+        N = len(block_ids)
         for _ in range(max_iters):
-            block_centers = np.random.choice(self.gdf.index, self.num_districts, replace=False)
+            block_centers = np.random.choice(block_ids, self.num_districts, replace=False)
             block_assignment = self._Hess_model(block_centers)
             new_centers = self._recenter(block_centers, block_assignment)
             new_centers = [self.short_geoid_list[int(center)] for center in new_centers]
             cnt = 0
-            print(f"ITERATION {cnt}: Centers updated from {block_centers} to {new_centers}")
             while sorted(block_centers) != sorted(new_centers):
                 block_centers = new_centers
                 block_assignment = self._Hess_model(block_centers)
                 new_centers = self._recenter(block_centers, block_assignment)
                 new_centers = [self.short_geoid_list[int(center)] for center in new_centers]
                 cnt += 1
-                print(f"ITERATION {cnt}: Centers updated from {block_centers} to {new_centers}")
-
-            # Calculate the lower bound of the objective value for all districts and the worst district
-            obj_dict_lb = self._SDP(block_assignment, block_centers)
-            # district_lb_costs = [obj_dict_lb[center]['bhh']**2 * obj_dict_lb[center]['district_mass'] for center in block_centers]
-            # worst_district_lb = max(obj_dict_lb.items(), key=lambda x: x[1]['bhh']**2 * x[1]['district_mass'])
-            # worst_district_cost_lb = worst_district_lb[1]['bhh']**2 * worst_district_lb[1]['district_mass']
-            district_lb_costs = [obj_dict_lb[center]['bhh'] for center in block_centers]
-            worst_district_lb = max(obj_dict_lb.items(), key=lambda x: x[1]['bhh'])
-            worst_district_cost_lb = worst_district_lb[1]['bhh']
-
-            # Calculate the upper bound of the objective value for all districts and the worst district
-            obj_dict_ub = self._LP(block_assignment, block_centers)
-            district_ub_costs = [obj_dict_ub[center]['bhh']**2 * obj_dict_ub[center]['district_area'] for center in block_centers]
-            worst_district_ub = max(obj_dict_ub.items(), key=lambda x: x[1]['bhh']**2 * x[1]['district_area'])
-            worst_district_cost_ub = worst_district_ub[1]['bhh']**2 * worst_district_ub[1]['district_area']
-
-            # print(f"The gap between the lower and upper bound is {worst_district_cost_ub - worst_district_cost_lb}")
-            
-            worst_district_list.append({'lb': (worst_district_lb, worst_district_cost_lb), 'ub': (worst_district_ub, worst_district_cost_ub)})
-            district_costs_list.append({'lb': district_lb_costs, 'ub': district_ub_costs})
-            block_centers_list.append(block_centers)
-
-            if criterion == 'lb':
-                if worst_district_cost_lb < best_obj_val_lb:
-                    best_obj_val_lb = worst_district_cost_lb
-                    best_block_centers = block_centers
-            elif criterion == 'ub':
-                if worst_district_cost_ub < best_obj_val_ub:
-                    best_obj_val_ub = worst_district_cost_ub
-                    best_block_centers = block_centers
-        
-        if criterion == 'lb':
-            best_obj_val = best_obj_val_lb
-        elif criterion == 'ub':
-            best_obj_val = best_obj_val_ub
-
+            if block_assignment.shape[1] != N:
+                expanded_assignment = self._expand_assignment_matrix(block_assignment, block_centers)
+            else:
+                expanded_assignment = block_assignment
+            obj_val, district_info = self.evaluate_real_objective(expanded_assignment, prob_dict, Lambda, wr, wv, beta)
+            if obj_val < best_obj_val:
+                best_obj_val = obj_val
+                best_block_centers = block_centers
+                best_assignment = expanded_assignment
+                best_district_info = district_info
         print(f"Best block centers: {best_block_centers}")
         print(f"Best objective value: {best_obj_val}")
-        best_assignment = self._Hess_model(best_block_centers)
+        return best_block_centers, best_assignment, best_obj_val, best_district_info
 
-        return best_block_centers, best_assignment, best_obj_val, worst_district_list, district_costs_list, block_centers_list
-        
-
-    def local_search(self, block_centers, best_obj_val, criterion='lb'):
-
-        assert criterion in ['lb', 'ub'], "Criterion must be either 'lb' or 'ub'"
+    def local_search(self, block_centers, best_obj_val, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120):
+        """
+        Local search for the best partition using the real-problem objective.
+        Returns best_block_centers, best_assignment, best_obj_val, best_district_info
+        """
+        block_centers = list(block_centers)
         assert len(block_centers) == self.num_districts, f"Got {len(block_centers)} block centers but expected {self.num_districts} districts"
-
         assignment = self._Hess_model(block_centers)
-        obj_dict = self._SDP(assignment, block_centers) if criterion == 'lb' else self._LP(assignment, block_centers)
-        if criterion == 'lb':
-            obj_val_dict = {node: obj_dict[node]['bhh'] for node in obj_dict.keys()}
-            best_obj_val = max(obj_val_dict.values())
-        elif criterion == 'ub':
-            obj_val_dict = {node: obj_dict[node]['bhh']**2 * obj_dict[node]['district_area'] for node in obj_dict.keys()}
-            best_obj_val = max(obj_val_dict.values())
-        print(f"Original objective value: {best_obj_val}")
-
+        N = len(self.short_geoid_list)
+        if assignment.shape[1] != N:
+            expanded_assignment = self._expand_assignment_matrix(assignment, block_centers)
+        else:
+            expanded_assignment = assignment
+        obj_val, district_info = self.evaluate_real_objective(expanded_assignment, prob_dict, Lambda, wr, wv, beta)
+        print(f"Original objective value: {obj_val}")
+        best_assignment = expanded_assignment
+        best_obj_val = obj_val
+        best_district_info = district_info
         for center in block_centers:
             for neighbor in self.geodata.G.neighbors(center):
                 if neighbor not in block_centers:
-                    new_centers = block_centers.copy()
+                    new_centers = list(block_centers.copy())
                     new_centers.remove(center)
                     new_centers.append(neighbor)
                     new_assignment = self._Hess_model(new_centers)
-                    if criterion == 'lb':
-                        new_obj_dict = self._SDP(new_assignment, new_centers)
-                        new_obj_val_dict = {node: new_obj_dict[node]['bhh'] for node in new_obj_dict.keys()}
-                        new_obj_val = max(new_obj_val_dict.values())
-                    elif criterion == 'ub':
-                        new_obj_dict = self._LP(new_assignment, new_centers)
-                        new_obj_val_dict = {node: new_obj_dict[node]['bhh']**2 * new_obj_dict[node]['district_area'] for node in new_obj_dict.keys()}
-                        new_obj_val = max(new_obj_val_dict.values())
-                    
+                    if new_assignment.shape[1] != N:
+                        expanded_new_assignment = self._expand_assignment_matrix(new_assignment, new_centers)
+                    else:
+                        expanded_new_assignment = new_assignment
+                    new_obj_val, new_district_info = self.evaluate_real_objective(expanded_new_assignment, prob_dict, Lambda, wr, wv, beta)
                     if new_obj_val < best_obj_val:
                         print(f"new obj val: {new_obj_val}")
                         block_centers = new_centers
                         best_obj_val = new_obj_val
-                        return self.local_search(block_centers, best_obj_val)
-                    
-        best_assignment = self._Hess_model(block_centers)
-        return block_centers, best_assignment, best_obj_val
+                        best_assignment = expanded_new_assignment
+                        best_district_info = new_district_info
+                        return self.local_search(block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta)
+        return block_centers, best_assignment, best_obj_val, best_district_info
 
     def _SDP_benders(self, assigned_blocks, root, prob_dict, epsilon, grid_points=20):
         """
@@ -555,3 +541,41 @@ class Partition:
             print("\nBenders decomposition finished.")
             print(f"Best cost: {best_cost:.4f}")
         return best_partition, best_cost, history
+
+    def evaluate_real_objective(self, assignment, prob_dict, Lambda, wr, wv, beta=0.7120):
+        """
+        Evaluate the real-problem objective for a given assignment (z matrix):
+        - assignment: np.ndarray (N_blocks x N_blocks), z[j, i]=1 if block j assigned to root i
+        - prob_dict: empirical distribution
+        - Lambda, wr, wv: parameters for the objective
+        - beta: risk parameter (default 0.7120)
+        Returns: max district cost, list of tuples (district_obj, root, K_i, T_star)
+        """
+        block_ids = self.short_geoid_list
+        N = len(block_ids)
+        epsilon = self.epsilon
+        district_info = []
+        for i, root in enumerate(block_ids):
+            # Get assigned blocks for this root
+            assigned = [j for j in range(N) if round(assignment[j, i]) == 1]
+            if not assigned or round(assignment[i, i]) != 1:
+                continue  # skip if not a root or no blocks assigned
+            assigned_blocks = [block_ids[j] for j in assigned]
+            # SDP inner maximization
+            cost, x_star, _, T_star, alpha_i = self._SDP_benders(assigned_blocks, root, prob_dict, epsilon)
+            # Get K_i for the root
+            K_i = float(self.geodata.get_K(root))
+            # F_i = 0
+            F_i = 0.0
+            # C_i = sqrt(T_star)
+            C_i = np.sqrt(T_star) if T_star is not None else 1.0
+            # Compute the full objective as in (8a)
+            term1 = (K_i + F_i) / C_i
+            term2 = beta * np.sqrt(Lambda / C_i) * alpha_i
+            term3 = wr * (1/wv * (K_i/2 + beta * np.sqrt(Lambda * C_i) * alpha_i) + C_i)
+            district_obj = term1 + term2 + term3
+            district_info.append((district_obj, root, K_i, T_star))
+        if not district_info:
+            return float('inf'), []
+        max_cost = max([info[0] for info in district_info])
+        return max_cost, district_info

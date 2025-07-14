@@ -12,6 +12,7 @@ from shapely.geometry import LineString, Point
 from shapely.ops import transform
 from pyproj import Transformer
 import logging
+import pyproj
 
 
 class GeoData:
@@ -175,12 +176,10 @@ class GeoData:
     def plot_partition(self, assignment):
         """
         Visualize the partition of block groups into districts.
-        
         Parameters:
         assignment (np.ndarray): Binary array of shape (n_block_groups, n_centers),
                                 where each row has exactly one 1.
         gdf (GeoDataFrame): GeoDataFrame of block groups; order must match assignment rows.
-        
         Returns:
         centers (dict): Dictionary mapping each district (center index) to its center block group id.
         """
@@ -189,36 +188,84 @@ class GeoData:
         gdf = self.gdf.copy()  # avoid modifying the original GeoDataFrame
         gdf['district'] = district_labels
 
-        # Create the plot with a categorical colormap.
+        # Try to map district indices to names if possible
+        if 'district_name' in gdf.columns:
+            district_names = gdf['district_name']
+        else:
+            district_names = gdf['district']
+
+        # Custom color mapping
+        custom_colors = {
+            'East Pittsburgh': '#ADD8E6',  # light blue
+            'Moronville': '#0000FF',      # blue
+            'McKeesport': '#8B4513',      # brown
+        }
+        # Build color map for all districts
+        unique_districts = np.unique(district_labels)
+        color_map = {}
+        cmap = plt.get_cmap('tab20', len(unique_districts))
+        for i, district in enumerate(unique_districts):
+            # Try to get the name from the most common value in the group
+            name = gdf[gdf['district'] == district]['district'].mode().values[0]
+            # If the name is in custom_colors, use it
+            if name in custom_colors:
+                color_map[district] = custom_colors[name]
+            else:
+                color_map[district] = cmap(i)
+
         fig, ax = plt.subplots(figsize=(15, 15))
-        gdf.plot(column='district', cmap='tab20', legend=False, ax=ax)
-        
-        centers = {}
-        # For each district, determine the center block group.
-        for district in np.unique(district_labels):
+        for district in unique_districts:
             subset = gdf[gdf['district'] == district]
-            # Compute centroids of the block groups in this district.
+            subset.plot(ax=ax, color=color_map[district], edgecolor='black')
+        centers = {}
+        for district in unique_districts:
+            subset = gdf[gdf['district'] == district]
             centroids = subset.geometry.centroid
-            # Compute the average centroid (district centroid)
             avg_x = centroids.x.mean()
             avg_y = centroids.y.mean()
-            # Find the block group whose centroid is closest to the district centroid.
             distances = centroids.apply(lambda geom: ((geom.x - avg_x)**2 + (geom.y - avg_y)**2)**0.5)
-            center_idx = distances.idxmin()  # center's index (e.g., GEOID)
+            center_idx = distances.idxmin()
             centers[district] = center_idx
-            
-            # # Plot the boundary of the center block group with a thicker line.
-            # subset.loc[[center_idx]].boundary.plot(ax=ax, edgecolor='black', linewidth=3)
-            # Optionally, add a marker at the center.
-            # ax.plot(centroids.loc[center_idx].x, centroids.loc[center_idx].y, marker='o',
-            #         color='white', markersize=3)
-            ax.plot(avg_x, avg_y, marker='o',
-                    color='white', markersize=3)
-        
-        plt.title("District Partition with Center Block Groups")
+            ax.plot(avg_x, avg_y, marker='o', color='white', markersize=3)
         plt.show()
-        
         return centers
+
+    
+    def get_K(self, block):
+        if 'K' in self.gdf.columns:
+            return self.gdf.loc[block, 'K']
+        else:
+            logging.warning(f"K not found for block {block}, returning default 0.0")
+            return 0.0
+
+    def get_F(self, block):
+        if 'F' in self.gdf.columns:
+            return self.gdf.loc[block, 'F']
+        else:
+            # logging.warning(f"F not found for block {block}, returning default 1.0")
+            return 0.0
+
+    def compute_K_for_all_blocks(self, depot_lat=40.38651, depot_lon=-79.82444):
+        """
+        Compute K_i for each block as the roundtrip distance from the depot (Walmart Garden Center)
+        to the centroid of the block, using projected coordinates (meters, then convert to km).
+        Store the result in self.gdf['K'] (in kilometers).
+        """
+        from shapely.geometry import Point
+        import pyproj
+        # Project depot to EPSG:2163
+        wgs84 = pyproj.CRS('EPSG:4326')
+        proj = self.gdf.crs
+        transformer = pyproj.Transformer.from_crs(wgs84, proj, always_xy=True)
+        depot_x, depot_y = transformer.transform(depot_lon, depot_lat)
+        depot_pt = Point(depot_x, depot_y)
+        K_list = []
+        for idx, row in self.gdf.iterrows():
+            centroid = row.geometry.centroid
+            dist = depot_pt.distance(centroid) / 1000.0  # in km
+            K_list.append(2 * dist)  # roundtrip
+        self.gdf['K'] = K_list
+        return self.gdf['K']
  
 
 class RouteData:
@@ -350,8 +397,6 @@ class RouteData:
         nearest_stops = self.find_nearest_stops()
         district_assignment = {idx: nearest_stops[idx]['route'] for idx in self.gdf.index}
         self.gdf['district'] = self.gdf.index.map(district_assignment)
-
-        # Find center of each district
         center_nodes = {}
         for district, group in self.gdf.groupby('district'):
             centroids = group.geometry.centroid
@@ -363,20 +408,25 @@ class RouteData:
                     best_dist, best_idx = d, idx
             center_nodes[district] = best_idx
         self.center_nodes = center_nodes
-
-
         if visualize:
-            # Plotting
             unique_districts = self.gdf['district'].unique()
-            cmap = cm.get_cmap('Set1', len(unique_districts))
-            color_map = {d: cmap(i) for i, d in enumerate(unique_districts)}
-
+            # Custom color mapping
+            custom_colors = {
+                'East Pittsburgh': '#ADD8E6',  # light blue
+                'Moronville': '#0000FF',      # blue
+                'McKeesport': '#8B4513',      # brown
+            }
+            cmap = plt.get_cmap('tab20', len(unique_districts))
+            color_map = {}
+            for i, district in enumerate(unique_districts):
+                if district in custom_colors:
+                    color_map[district] = custom_colors[district]
+                else:
+                    color_map[district] = cmap(i)
             fig, ax = plt.subplots(figsize=(15, 15))
             for district in unique_districts:
                 subset = self.gdf[self.gdf['district'] == district]
                 subset.plot(ax=ax, color=color_map[district], edgecolor='black')
-
-            # Overlay routes
             for route in self.routes_info:
                 name = route.get("Description", f"Route {route.get('RouteID')}")
                 poly = route.get("EncodedPolyline")
@@ -389,54 +439,42 @@ class RouteData:
                         ax.plot(*proj_line.xy, color=color, linewidth=2)
                     except Exception as e:
                         print(f"Error decoding polyline for {name}: {e}")
-
-            # Plot centers
             for district, idx in center_nodes.items():
                 geom = self.gdf.loc[idx].geometry
                 boundary = getattr(geom, 'exterior', geom.boundary)
                 ax.plot(*boundary.xy, color='red', linewidth=3)
                 pt = geom.centroid
                 ax.plot(pt.x, pt.y, 'o', color='red', markersize=10)
-                ax.text(pt.x, pt.y, str(district), fontsize=12, fontweight='bold',
-                        color='red', ha='center', va='center')
-
-            # Build custom legend for districts
+                ax.text(pt.x, pt.y, str(district), fontsize=12, fontweight='bold', color='red', ha='center', va='center')
             legend_handles = [
                 mpatches.Patch(facecolor=color_map[d], edgecolor='black', label=str(d))
                 for d in unique_districts
             ]
             ax.legend(handles=legend_handles, title='District', loc='upper right')
-            plt.title("Partition of Block Groups into Districts by Nearest Route Stop")
+            # plt.title("Partition of Block Groups into Districts by Nearest Route Stop")
             plt.show()
 
     def build_assignment_matrix(self, visualize=True):
         """
         Construct a binary assignment matrix where entry (i, j) = 1 if the i-th block group
         (in self.short_geoid_list) is assigned to the center corresponding to the j-th center.
-
         Returns:
             assignment: np.ndarray of shape (n_groups, n_centers)
             center_list: list of center node identifiers (short GEOID index)
         """
-        
         self._get_fixed_route_assignment(visualize=visualize)
         center_list = list(self.center_nodes.values())
         n_groups = len(self.short_geoid_list)
         n_centers = len(center_list)
         assignment = np.zeros((n_groups, n_centers), dtype=int)
-
-        # Map geoid to row index
         geo_to_row = {geoid: i for i, geoid in enumerate(self.short_geoid_list)}
-        # Map center idx to column
         center_to_col = {center: j for j, center in enumerate(center_list)}
-
         for geoid in self.short_geoid_list:
             i = geo_to_row[geoid]
             district = self.gdf.loc[geoid, 'district']
             center = self.center_nodes[district]
             j = center_to_col[center]
             assignment[i, j] = 1
-
         return assignment, center_list
 
 
@@ -509,16 +547,3 @@ def load_data(meta_path, data_path):
     
     return data
 
-    def get_K(self, block):
-        if 'K' in self.gdf.columns:
-            return self.gdf.loc[block, 'K']
-        else:
-            logging.warning(f"K not found for block {block}, returning default 1.0")
-            return 0.0
-
-    def get_F(self, block):
-        if 'F' in self.gdf.columns:
-            return self.gdf.loc[block, 'F']
-        else:
-            logging.warning(f"F not found for block {block}, returning default 1.0")
-            return 0.0

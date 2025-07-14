@@ -233,6 +233,26 @@ class ToyGeoData:
         })
         self.gdf.index = self.short_geoid_list
 
+    def compute_K_for_all_blocks(self, depot_lat=0, depot_lon=0):
+        """
+        Compute K_i for each block as the roundtrip Euclidean distance from the depot (depot_lat, depot_lon)
+        to the block's grid position. Store in self.K_dict and as a 'K' column in self.gdf if available.
+        """
+        K_dict = {}
+        for block_id in self.short_geoid_list:
+            row, col = self.grid_positions[block_id]
+            # Treat (row, col) as (y, x) in grid; depot is at (depot_lat, depot_lon)
+            dist = ((row - depot_lat) ** 2 + (col - depot_lon) ** 2) ** 0.5
+            K_dict[block_id] = 2 * dist  # roundtrip
+        self.K_dict = K_dict
+        # Optionally store in gdf if it exists
+        if hasattr(self, 'gdf') and hasattr(self.gdf, '__setitem__'):
+            self.gdf['K'] = [K_dict[bid] for bid in self.short_geoid_list]
+        return K_dict
+
+    def get_K(self, block):
+        return self.K_dict.get(block, 0.0)
+
 def generate_random_probabilities(block_ids, seed=42, distribution='uniform'):
     """Generate random probability distributions for blocks"""
     np.random.seed(seed)
@@ -304,7 +324,7 @@ def test_toy_model_25blocks():
             # Run LBBD
             print("Running Benders decomposition...")
             best_partition, best_cost, history = partition.benders_decomposition(
-                max_iterations=50, tolerance=1e-3, max_cuts=100, verbose=True
+                max_iterations=100, tolerance=1e-3, max_cuts=100, verbose=True
             )
             
             # Analyze results

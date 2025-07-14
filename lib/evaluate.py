@@ -487,13 +487,34 @@ class Evaluate:
         # Integrate the square root of the probability mass on the district, we use the vanilla implementation which can be optimized via
         # the optimal objective value obatined from get_tsp_worst_distributions
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
-        # Get the optimal dispatch interval
-        beta = 2287 / (math.sqrt(214) * 210)
-        interval = ((beta * district_prob_sqrt * math.sqrt(overall_arrival_rate)) / (unit_wait_cost)) ** (2/3)
-        interval = min(interval, max_dipatch_interval)
+        # Get the optimal dispatch interval using 1-D minimization as in Partition._SDP_benders
+        Tmin = 1e-3
+        Tmax = max_dipatch_interval  # Use argument as the upper bound for search
+        grid_points = 20
+        best_T = Tmin
+        best_obj = float('inf')
+        # For legacy compatibility, set K_i and F_i to 0 (or use actual values if available)
+        try:
+            K_i = float(self.geodata.get_K(center))
+        except Exception:
+            K_i = 0.0
+        try:
+            F_i = float(self.geodata.get_F(center))
+        except Exception:
+            F_i = 0.0
+        wr = getattr(self.geodata, 'wr', 1.0)
+        wv = getattr(self.geodata, 'wv', 10.0)
+        alpha_i = district_prob_sqrt  # for compatibility with Partition convention
+        for T in np.linspace(Tmin, Tmax, grid_points):
+            ci = np.sqrt(T)
+            g_bar = (K_i+F_i)*ci**-2 + alpha_i*ci**-1 + wr/(2*wv)*K_i + wr/wv*alpha_i*ci + wr*ci**2
+            if g_bar < best_obj:
+                best_obj = g_bar
+                best_T = T
+        interval = best_T
 
         mean_wait_time_per_interval_per_rider = interval / 2
-        mean_transit_distance_per_interval = beta * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
+        mean_transit_distance_per_interval = 2287 / (math.sqrt(214) * 210) * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
 
         # amt_wait_time = mean_wait_time_per_interval_per_rider / interval
         amt_transit_distance = mean_transit_distance_per_interval / interval
