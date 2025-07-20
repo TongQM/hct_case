@@ -368,107 +368,68 @@ class Partition:
         best_cost = float('inf')
         lower_bound = -float('inf')
         upper_bound = float('inf')
-        cuts = []
+        cuts = []  # Each cut: (cut_constant, cut_coeffs, cut_id)
         cut_id_counter = 0
+        cuts_added_to_model = 0  # Track how many cuts have been added to the model
         iteration = 0
         history = []
-        
-        # Get arc structures from GeoData
         arc_list = self.geodata.get_arc_list()
-        
-        # Validate arc structures
         if not hasattr(self.geodata, 'arc_list') or not arc_list:
             raise ValueError("GeoData arc_list is empty or not initialized. Check GeoData initialization.")
-        
         if verbose:
             print("Starting Benders decomposition...")
             print(f"Using {len(arc_list)} directed arcs from GeoData")
             print(f"Block IDs: {len(block_ids)} blocks")
-            
-            # Validate that all blocks have arc information
             missing_arcs = []
             for block_id in block_ids:
                 in_arcs = self.geodata.get_in_arcs(block_id)
                 out_arcs = self.geodata.get_out_arcs(block_id)
                 if not in_arcs and not out_arcs:
                     missing_arcs.append(block_id)
-            
             if missing_arcs:
                 print(f"Warning: {len(missing_arcs)} blocks have no arcs: {missing_arcs[:5]}...")
             else:
                 print("All blocks have arc information")
-        
+        # --- Create master problem ONCE ---
+        master = gp.Model("benders_master")
+        z = master.addVars(N, N, vtype=GRB.BINARY, name="assignment")  # z[j, i]: assign block j to root i (indices)
+        o = master.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="objval")
+        f = master.addVars(block_ids, arc_list, lb=0.0, vtype=GRB.CONTINUOUS, name="flows")
+        # Each block assigned to one district
+        master.addConstrs((gp.quicksum(z[j, i] for i in range(N)) == 1 for j in range(N)), name='one_assignment')
+        master.addConstr(gp.quicksum(z[i, i] for i in range(N)) == k, name='num_districts')
+        master.addConstrs((z[j, i] <= z[i, i] for i in range(N) for j in range(N)), name='break_symmetry')
+        for i, root_id in enumerate(block_ids):
+            master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(root_id)) == 0, name=f"no_return_flow_{root_id}")
+            for j, block_id in enumerate(block_ids):
+                if block_id != root_id:
+                    master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(block_id)) - gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_out_arcs(block_id)) == z[j, i], name=f"flow_assign_{block_id}_{root_id}")
+                    master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(block_id)) <= (N - 1) * z[j, i], name=f"flow_restrict_{block_id}_{root_id}")
+        master.setObjective(o, GRB.MINIMIZE)
+        master.setParam('OutputFlag', 0)
+        # --- End static model creation ---
         while iteration < max_iterations and (upper_bound - lower_bound > tolerance):
             if verbose:
                 print(f"\nIteration {iteration+1}")
-            master = gp.Model("benders_master")
-            z = master.addVars(N, N, vtype=GRB.BINARY, name="assignment")  # z[j, i]: assign block j to root i (indices)
-            o = master.addVar(lb=0.0, vtype=GRB.CONTINUOUS, name="objval")
-            # Create flow variables for each root and each arc
-            f = master.addVars(block_ids, arc_list, lb=0.0, vtype=GRB.CONTINUOUS, name="flows")
-
-
-            if verbose and iteration == 0:
-                print(f"Created {N*N} binary z variables and 1 objective variable")
-            
-            # Each block assigned to one district
-            master.addConstrs((gp.quicksum(z[j, i] for i in range(N)) == 1 for j in range(N)), name='one_assignment')
-            master.addConstr(gp.quicksum(z[i, i] for i in range(N)) == k, name='num_districts')
-            master.addConstrs((z[j, i] <= z[i, i] for i in range(N) for j in range(N)), name='break_symmetry')
-            
-            if verbose and iteration == 0:
-                print(f"Added basic assignment constraints: {N + 1 + N*N} constraints")
-                print(f"Model has {master.NumVars} variables and {master.NumConstrs} constraints after basic constraints")
-            # --- Add flow-based contiguity constraints (precise) ---
-            for i, root_id in enumerate(block_ids):
-                master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(root_id)) == 0, name=f"no_return_flow_{root_id}")
-                for j, block_id in enumerate(block_ids):
-                    if block_id != root_id:
-                        master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(block_id)) - gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_out_arcs(block_id)) == z[j, i], name=f"flow_assign_{block_id}_{root_id}")
-                        master.addConstr(gp.quicksum(f[root_id, arc[0], arc[1]] for arc in self.geodata.get_in_arcs(block_id)) <= (N - 1) * z[j, i], name=f"flow_restrict_{block_id}_{root_id}")
-            
-            if verbose and iteration == 0:
-                print(f"Created {len(f)} flow variables for {len(block_ids)} roots and {len(arc_list)} arcs")
-                print(f"Model has {master.NumVars} variables and {master.NumConstrs} constraints after variable creation")
-            
-            if verbose and iteration == 0:
-                print(f"Added flow constraints for contiguity")
-                print(f"Model has {master.NumVars} variables and {master.NumConstrs} constraints after constraints")
-            # --- Add Benders cuts ---
-            cut_handles = []
-            for cut_constant, cut_coeffs, cut_rhs, cut_id in cuts:
-                # Recreate cut expression with current model variables
-                cut_expr = cut_constant + gp.quicksum(cut_coeffs[j, i] * z[j, i] for (j, i) in cut_coeffs.keys()) - cut_rhs
-                cut_handles.append(master.addConstr(o >= cut_expr, name=f"cut_{cut_id}"))
-            master.setObjective(o, GRB.MINIMIZE)
-            master.setParam('OutputFlag', 0)
+            # --- Add only new Benders cuts for this iteration ---
+            for cut in cuts[cuts_added_to_model:]:
+                cut_constant, cut_coeffs, cut_id = cut
+                cut_expr = cut_constant + gp.quicksum(cut_coeffs[j, i] * z[j, i] for (j, i) in cut_coeffs.keys())
+                master.addConstr(o >= cut_expr, name=f"cut_{cut_id}")
+                if verbose:
+                    print(f"  [DEBUG] Added cut_{cut_id}: o >= {cut_constant:.4f} + " +
+                          " + ".join([f"{v:.4f}*z[{j},{i}]" for (j,i),v in cut_coeffs.items()]))
+            cuts_added_to_model = len(cuts)
             master.optimize()
-            
-            # Check optimization status
             if master.status != GRB.OPTIMAL:
-                logging.error(f"Master problem failed to solve optimally. Status: {master.status}")
                 if master.status == GRB.INFEASIBLE:
                     logging.error("Master problem is infeasible")
                     master.computeIIS()
                     master.write(f"infeasible_master_iter_{iteration}.ilp")
-                    logging.error("IIS written to file for debugging")
-                elif master.status == GRB.UNBOUNDED:
-                    logging.error("Master problem is unbounded")
-                elif master.status == GRB.INF_OR_UNBD:
-                    logging.error("Master problem is infeasible or unbounded")
+                    raise RuntimeError(f"Master problem infeasible at iteration {iteration}")
                 else:
-                    logging.error(f"Master problem optimization failed with status {master.status}")
-                
-                # Try to get some solution information if available
-                try:
-                    if master.SolCount > 0:
-                        logging.info("Using best available solution")
-                    else:
-                        logging.error("No solution available")
-                        raise RuntimeError(f"Master problem optimization failed with status {master.status}")
-                except:
-                    raise RuntimeError(f"Master problem optimization failed with status {master.status}")
-            
+                    logging.error(f"Master problem failed with status {master.status}")
+                    raise RuntimeError(f"Master problem failed with status {master.status} at iteration {iteration}")
             z_sol = np.zeros((N, N))
             for i in range(N):
                 for j in range(N):
@@ -485,39 +446,28 @@ class Partition:
                 subgrads.append(subgrad)
             worst_idx = int(np.argmax([c[0] for c in district_costs]))
             worst_cost, worst_root, worst_blocks, worst_subgrad, x_star, T_star, alpha_i = district_costs[worst_idx]
-            
             # Multi-cuts: Generate a cut for EVERY district, not just the worst one
             cuts_added = 0
             for cost, root, assigned_blocks, subgrad, x_star_dist, T_star_dist, alpha_i_dist in district_costs:
-                # Store cut coefficients instead of expressions
-                cut_constant = cost
-                cut_coeffs = {}  # coefficients for z variables
-                cut_rhs = 0.0
+                # Construct cut: o >= cost + sum_j g_j * (z[j,root] - z_sol[j,root])
+                cut_coeffs = {}
+                cut_rhs_val = 0.0
                 for j in range(N):
                     g_j = subgrad.get(block_ids[j], 0.0)
                     if g_j != 0.0:
-                        cut_coeffs[j, root] = g_j  # z[j,i] indexing
-                        cut_rhs += g_j * z_sol[j, root]
-                
-                cuts.append((cut_constant, cut_coeffs, cut_rhs, cut_id_counter))
+                        cut_coeffs[j, root] = g_j
+                        cut_rhs_val += g_j * z_sol[j, root]
+                # Validation: ensure indices are consistent
+                assert isinstance(root, int) and 0 <= root < N, f"Root index {root} out of bounds"
+                cut_constant = cost - cut_rhs_val
+                cuts.append((cut_constant, cut_coeffs, cut_id_counter))
+                if verbose:
+                    print(f"  [DEBUG] Will add cut_{cut_id_counter} next iter: o >= {cut_constant:.4f} + " +
+                          " + ".join([f"{v:.4f}*z[{j},{i}]" for (j, i), v in cut_coeffs.items() if j == i]))
                 cut_id_counter += 1
                 cuts_added += 1
-                if verbose:
-                    print(f"  Added cut for district {block_ids[root]}: cost={cost:.4f}, T*={T_star_dist:.4f}, alpha={alpha_i_dist:.4f}")
-            
             if verbose:
-                print(f"  Total cuts added: {cuts_added} (multi-cuts approach)")
-            if len(cuts) > max_cuts:
-                violations = []
-                for idx, (cut_constant, cut_coeffs, cut_rhs, cut_id) in enumerate(cuts):
-                    # Calculate cut value at current solution
-                    cut_val = cut_constant - sum(cut_coeffs[j, i] * z_sol[j, i] for (j, i) in cut_coeffs.keys()) + cut_rhs
-                    slack = o_sol - cut_val
-                    violations.append(abs(slack))
-                idx_remove = int(np.argmin(violations))
-                if verbose:
-                    print(f"  Removing least violated cut: cut_{cuts[idx_remove][3]} (violation={violations[idx_remove]:.4e})")
-                cuts.pop(idx_remove)
+                print(f"  Total cuts generated this iter: {cuts_added} (multi-cuts approach)")
             lower_bound = o_sol
             upper_bound = min(upper_bound, worst_cost)
             if verbose:
