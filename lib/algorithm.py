@@ -699,16 +699,30 @@ class Partition:
                     master.addConstr(F[i] == omega[i, 0], name=f'odd_cost_linear_{i}')
         
         # (7i) ODD constraint: ω_i[d] >= max{Ω_j[d] : j ∈ district i}
-        # This is implemented as: ω_i[d] >= Ω_j[d] * z_ji for all j, d
+        # Efficient implementation: O(N²) instead of O(N³) constraints
+        
+        # Pre-compute all ODD values and find global maximum for big-M
+        all_omega_values = []
+        for j in range(N):
+            if hasattr(Omega_dict[block_ids[j]], '__len__'):
+                all_omega_values.extend(Omega_dict[block_ids[j]])
+            else:
+                all_omega_values.append(Omega_dict[block_ids[j]])
+        M_omega = max(all_omega_values) if all_omega_values else 10.0
+        
         for i in range(N):  # For each district
             for d in range(odd_dim):  # For each ODD dimension
+                # ω_i[d] must be at least the maximum ODD value of any assigned block
                 for j in range(N):  # For each block
                     if hasattr(Omega_dict[block_ids[j]], '__len__'):
-                        omega_jd = Omega_dict[block_ids[j]][d]  # j-th block, d-th dimension
+                        omega_jd = Omega_dict[block_ids[j]][d]
                     else:
-                        omega_jd = Omega_dict[block_ids[j]]  # Scalar case
-                    master.addConstr(omega[i, d] >= omega_jd * z[j, i], 
-                                   name=f'odd_elementwise_max_{i}_{d}_{j}')
+                        omega_jd = Omega_dict[block_ids[j]]
+                    
+                    # If block j is assigned to district i (z[j,i] = 1), then ω_i[d] >= Ω_j[d]
+                    # If block j is not assigned (z[j,i] = 0), constraint is relaxed
+                    master.addConstr(omega[i, d] >= omega_jd - M_omega * (1 - z[j, i]), 
+                                   name=f'odd_max_{i}_{d}_{j}')
         
         # (7j) Ensure o >= K_i + F_i for all districts (basic lower bound)
         # This ensures o represents the maximum district cost and cannot be arbitrarily small
