@@ -132,7 +132,8 @@ def test_lbbd_final():
         tolerance=1e-2,
         verbose=True,
         Omega_dict=Omega_dict,
-        J_function=J_function
+        J_function=J_function,
+        parallel=True
     )
     elapsed_time = time.time() - start_time
     

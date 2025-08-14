@@ -6,6 +6,9 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from lib.data import GeoData
 import logging
+import concurrent.futures
+from functools import partial
+import multiprocessing as mp
 
 
 class Partition:
@@ -383,6 +386,7 @@ class Partition:
         ci_star = np.sqrt(T_star)
         g_alpha = ci_star**-1 + wr/wv*ci_star
         g_K = ci_star**-2 + wr/(2*wv)
+        g_F = ci_star**-2
         
         # Subgradient: g_j for ALL blocks (not just assigned ones)
         # Since α_i = β * √Λ * Σ x_j * sqrt(area_j) * z_ji,
@@ -394,7 +398,7 @@ class Partition:
             # Include BHH factors in subgradient
             dalpha_dzji = beta * np.sqrt(Lambda) * x_star[j] * sqrt_area_j
             if bi == root:
-                subgrad[bi] = g_alpha * dalpha_dzji + g_K * (K_i + F_i)
+                subgrad[bi] = g_alpha * dalpha_dzji + ((K_i + F_i) * ci_star**-2 + wr/(2*wv) * K_i + wr * ci_star**2)
             else:
                 subgrad[bi] = g_alpha * dalpha_dzji
         
@@ -403,11 +407,11 @@ class Partition:
         # Return x_star for ALL blocks (not just assigned ones)
         # Also return subgradients w.r.t. K_i and F_i for master problem
         subgrad_K_i = g_K  # ∂g/∂K_i = ci_star**-2 + wr/(2*wv)
-        subgrad_F_i = g_K  # ∂g/∂F_i = ci_star**-2 (same as K_i in this formulation)
+        subgrad_F_i = g_F  # ∂g/∂F_i = ci_star**-2
         
         return best_obj, dict(zip(all_blocks, x_star)), subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i
 
-    def _CQCP_benders_updated(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None):
+    def _CQCP_benders_updated(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False):
         """
         Updated CQCP subproblem that accepts partition-dependent costs K_i and F_i as parameters.
         
@@ -542,8 +546,23 @@ class Partition:
         # Also return subgradients w.r.t. K_i and F_i for master problem
         return best_obj, dict(zip(all_blocks, x_star)), subgrad, C_star, alpha_i, subgrad_K_i, subgrad_F_i
 
+    def _solve_subproblem_parallel(self, args):
+        """
+        Wrapper function for parallel subproblem solving
+        """
+        assigned_block_ids, root_id, prob_dict, epsilon, K_i, F_i, J_function, omega_sol = args
+        
+        # Calculate actual F_i using the J_function and the district's ODD vector
+        actual_F_i = J_function(omega_sol)
+        
+        # Call subproblem solver with thread-safe flag
+        return self._CQCP_benders_updated(
+            assigned_block_ids, root_id, prob_dict, epsilon, 
+            K_i=K_i, F_i=actual_F_i, single_threaded=True
+        )
+
     def benders_decomposition(self, max_iterations=50, tolerance=1e-3, verbose=True, 
-                            Omega_dict=None, J_function=None):
+                            Omega_dict=None, J_function=None, parallel=True):
         """
         Updated LBBD with depot location decisions and partition-dependent costs.
         Uses multi-cut generation for all active districts (no limit on number of cuts).
@@ -554,6 +573,7 @@ class Partition:
         - verbose: whether to print debug information
         - Omega_dict: dict mapping block_id to Omega_j (2D ODD feature vector)
         - J_function: function that takes 2D omega_i vector and returns F_i (ODD cost)
+        - parallel: whether to use parallel subproblem solving (default True)
         """
         block_ids = self.short_geoid_list  # short_GEOID strings
         N = len(block_ids)
@@ -572,6 +592,8 @@ class Partition:
         iteration = 0
         history = []
         arc_list = self.geodata.get_arc_list()
+        
+        # Use original epsilon throughout (no scaling)
         
         # Default parameters if not provided
         if Omega_dict is None:
@@ -690,8 +712,8 @@ class Partition:
         
         # (7j) Ensure o >= K_i + F_i for all districts (basic lower bound)
         # This ensures o represents the maximum district cost and cannot be arbitrarily small
-        for i in range(N):
-            master.addConstr(o >= K[i] + F[i], name=f'min_district_cost_{i}')
+        # for i in range(N):
+        #     master.addConstr(o >= K[i] + F[i], name=f'min_district_cost_{i}')
         
         # TODO: Add logical constraints later after testing basic single-cut functionality
         # Logical constraints: If district i is not selected (z_{ii} = 0), then K_i = 0 and F_i = 0
@@ -725,157 +747,222 @@ class Partition:
         master.setObjective(o, GRB.MINIMIZE)
         master.setParam('OutputFlag', 0)
         # --- End static model creation ---
+        
+        # Main LBBD iteration loop
         while iteration < max_iterations and (upper_bound - lower_bound > tolerance):
             if verbose:
                 print(f"\nIteration {iteration+1}")
-            # --- Add only new Benders cuts for this iteration ---
-            for cut_info in cuts[cuts_added_to_model:]:
-                cut_constant = cut_info['constant']
-                cut_coeffs_z = cut_info['z_coeffs']
-                K_coeff = cut_info['K_coeff']
-                F_coeff = cut_info['F_coeff']
-                district = cut_info['district']
-                cut_id = cut_info['id']
+                print(f"  [DEBUG] While loop condition: iter={iteration} < {max_iterations} and gap={upper_bound - lower_bound:.4f} > {tolerance}")
                 
-                # Build cut expression: o >= constant + Σ(coeff_z * z_ji) + coeff_K * K_district + coeff_F * F_district
-                cut_expr = cut_constant
-                
-                # Add z coefficients
-                if cut_coeffs_z:
-                    cut_expr += gp.quicksum(cut_coeffs_z[j, i] * z[j, i] for (j, i) in cut_coeffs_z.keys())
-                
-                # Add K coefficient (if non-zero)
-                if K_coeff != 0:
-                    cut_expr += K_coeff * K[district]
-                
-                # Add F coefficient (if non-zero)  
-                if F_coeff != 0:
-                    cut_expr += F_coeff * F[district]
-                
-                # Add cut to master problem: o >= cost_of_district_i
-                master.addConstr(o >= cut_expr, name=f"cut_{cut_id}")
-                
+                # --- Add all pending cuts from previous iteration ---
                 if verbose:
-                    z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j,i),v in cut_coeffs_z.items()])
-                    K_term = f" + {K_coeff:.4f}*K[{district}]" if K_coeff != 0 else ""
-                    F_term = f" + {F_coeff:.4f}*F[{district}]" if F_coeff != 0 else ""
-                    print(f"  [DEBUG] Added cut_{cut_id}: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
+                    print(f"  [DEBUG] Processing cuts: cuts_added_to_model={cuts_added_to_model}, total_cuts={len(cuts)}, new_cuts={len(cuts[cuts_added_to_model:])}")
+                
+                new_cuts_added = 0
+                for cut_info in cuts[cuts_added_to_model:]:
+                    cut_constant = cut_info['constant']
+                    cut_coeffs_z = cut_info['z_coeffs']
+                    K_coeff = cut_info['K_coeff']
+                    F_coeff = cut_info['F_coeff']
+                    district = cut_info['district']
+                    cut_id = cut_info['id']
+                
+                    # Build cut expression: o >= constant + Σ(coeff_z * z_ji) + coeff_K * K_district + coeff_F * F_district
+                    cut_expr = cut_constant
+                
+                    # Add z coefficients
+                    if cut_coeffs_z:
+                        cut_expr += gp.quicksum(cut_coeffs_z[j, i] * z[j, i] for (j, i) in cut_coeffs_z.keys())
+                
+                    # Add K coefficient (if non-zero)
+                    if K_coeff != 0:
+                        cut_expr += K_coeff * K[district]
+                
+                    # Add F coefficient (if non-zero)  
+                    if F_coeff != 0:
+                        cut_expr += F_coeff * F[district]
+                
+                    # Add cut to master problem: o >= cost_of_district_i
+                    master.addConstr(o >= cut_expr, name=f"cut_{cut_id}")
+                    new_cuts_added += 1
+                
+                    if verbose:
+                        z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j,i),v in cut_coeffs_z.items()])
+                        K_term = f" + {K_coeff:.4f}*K[{district}]" if K_coeff != 0 else ""
+                        F_term = f" + {F_coeff:.4f}*F[{district}]" if F_coeff != 0 else ""
+                        print(f"  [DEBUG] Added cut_{cut_id}: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
+                
+                # Update cuts_added_to_model AFTER adding cuts to master
+                cuts_added_to_model += new_cuts_added
+                if verbose and new_cuts_added > 0:
+                    print(f"  [DEBUG] Updated cuts_added_to_model: {cuts_added_to_model-new_cuts_added} -> {cuts_added_to_model}")
+                
+                # Optimize master problem after adding all pending cuts
+                if verbose:
+                    print(f"  [DEBUG] Optimizing master problem with {cuts_added_to_model} cuts in model...")
+                master.optimize()
+                if master.status != GRB.OPTIMAL:
+                    if master.status == GRB.INFEASIBLE:
+                        logging.error("Master problem is infeasible")
+                        master.computeIIS()
+                        master.write(f"infeasible_master_iter_{iteration}.ilp")
+                        raise RuntimeError(f"Master problem infeasible at iteration {iteration}")
+                    else:
+                        logging.error(f"Master problem failed with status {master.status}")
+                        raise RuntimeError(f"Master problem failed with status {master.status} at iteration {iteration}")
+                # Extract solution
+                z_sol = np.zeros((N, N))
+                for i in range(N):
+                    for j in range(N):
+                        z_sol[j, i] = z[j, i].X
+                o_sol = o.X
+            
+                # Extract depot location
+                depot_sol = [j for j in range(N) if round(delta[j].X) == 1]
+                if len(depot_sol) != 1:
+                    raise RuntimeError(f"Invalid depot solution: {len(depot_sol)} depots selected")
+                depot_block = block_ids[depot_sol[0]]
+            
+                # Extract partition-dependent costs
+                K_sol = [K[i].X for i in range(N)]
+                F_sol = [F[i].X for i in range(N)]
+            
+                # Extract 2D ODD vectors
+                omega_sol = []
+                for i in range(N):
+                    if odd_dim >= 2:
+                        omega_sol.append(np.array([omega[i, d].X for d in range(odd_dim)]))
+                    else:
+                        omega_sol.append(omega[i, 0].X)
+            
+                roots = [i for i in range(N) if round(z_sol[i, i]) == 1]
+                district_costs = []
+                subgrads = []
+            
+                # Generate cuts for existing districts (selected roots)
+                # Use parallel solving only when it's beneficial (>=3 districts, sufficient problem size)
+                use_parallel = (parallel and len(roots) >= 3 and 
+                              sum(len([j for j in range(N) if round(z_sol[j, root]) == 1]) for root in roots) >= 12)
+                
+                if use_parallel:
+                    # Parallel subproblem solving
+                    subproblem_args = []
+                    for root in roots:
+                        assigned_blocks = [j for j in range(N) if round(z_sol[j, root]) == 1]
+                        assigned_block_ids = [block_ids[j] for j in assigned_blocks]
+                        district_omega = omega_sol[root]
+                        args = (assigned_block_ids, block_ids[root], self.prob_dict, self.epsilon, 
+                               K_sol[root], F_sol[root], J_function, district_omega)
+                        subproblem_args.append((args, root, assigned_blocks))
+                
+                    # Solve subproblems in parallel with timing
+                    import time
+                    parallel_start = time.time()
                     
-            cuts_added_to_model = len(cuts)
-            master.optimize()
-            if master.status != GRB.OPTIMAL:
-                if master.status == GRB.INFEASIBLE:
-                    logging.error("Master problem is infeasible")
-                    master.computeIIS()
-                    master.write(f"infeasible_master_iter_{iteration}.ilp")
-                    raise RuntimeError(f"Master problem infeasible at iteration {iteration}")
+                    # Use fewer workers to reduce contention (max 2 for most cases)
+                    max_workers = min(2, len(roots))
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = []
+                        for args, root, assigned_blocks in subproblem_args:
+                            future = executor.submit(self._solve_subproblem_parallel, args)
+                            futures.append((future, root, assigned_blocks))
+                        
+                        # Collect results
+                        for future, root, assigned_blocks in futures:
+                            cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = future.result()
+                            district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
+                            subgrads.append(subgrad)
+                    
+                    parallel_time = time.time() - parallel_start
+                    if verbose:
+                        print(f"  Solved {len(roots)} subproblems in parallel ({parallel_time:.3f}s, {max_workers} workers)")
                 else:
-                    logging.error(f"Master problem failed with status {master.status}")
-                    raise RuntimeError(f"Master problem failed with status {master.status} at iteration {iteration}")
-            # Extract solution
-            z_sol = np.zeros((N, N))
-            for i in range(N):
-                for j in range(N):
-                    z_sol[j, i] = z[j, i].X
-            o_sol = o.X
+                    # Serial subproblem solving (fallback or single district)
+                    import time
+                    serial_start = time.time()
+                    
+                    for root in roots:
+                        assigned_blocks = [j for j in range(N) if round(z_sol[j, root]) == 1]
+                        # Pass the partition-dependent costs to subproblem
+                        # Compute actual F_i using the J_function and the district's ODD vector
+                        district_omega = omega_sol[root]
+                        actual_F_i = J_function(district_omega)
+                    
+                        cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders_updated(
+                            [block_ids[j] for j in assigned_blocks], block_ids[root], 
+                            self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i)
+                        district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
+                        subgrads.append(subgrad)
+                    
+                    serial_time = time.time() - serial_start
+                    if verbose:
+                        print(f"  Solved {len(roots)} subproblems serially ({serial_time:.3f}s)")
             
-            # Extract depot location
-            depot_sol = [j for j in range(N) if round(delta[j].X) == 1]
-            if len(depot_sol) != 1:
-                raise RuntimeError(f"Invalid depot solution: {len(depot_sol)} depots selected")
-            depot_block = block_ids[depot_sol[0]]
+                # Multi-cut Benders: Generate cuts for ALL active districts
+                cuts_added = 0
+                worst_cost = 0.0  # Track the maximum district cost for upper bound
             
-            # Extract partition-dependent costs
-            K_sol = [K[i].X for i in range(N)]
-            F_sol = [F[i].X for i in range(N)]
-            
-            # Extract 2D ODD vectors
-            omega_sol = []
-            for i in range(N):
-                if odd_dim >= 2:
-                    omega_sol.append(np.array([omega[i, d].X for d in range(odd_dim)]))
-                else:
-                    omega_sol.append(omega[i, 0].X)
-            
-            roots = [i for i in range(N) if round(z_sol[i, i]) == 1]
-            district_costs = []
-            subgrads = []
-            
-            # Generate cuts for existing districts (selected roots)
-            for root in roots:
-                assigned_blocks = [j for j in range(N) if round(z_sol[j, root]) == 1]
-                # Pass the partition-dependent costs to subproblem
-                # Compute actual F_i using the J_function and the district's ODD vector
-                district_omega = omega_sol[root]
-                actual_F_i = J_function(district_omega)
+                # Generate a Benders cut for each active district
+                for cost, root, assigned_blocks, subgrad, x_star_dist, T_star_dist, alpha_i_dist, subgrad_K_i_dist, subgrad_F_i_dist in district_costs:
+                    # Update worst cost for upper bound calculation
+                    worst_cost = max(worst_cost, cost)
                 
-                cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders_updated(
-                    [block_ids[j] for j in assigned_blocks], block_ids[root], 
-                    self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i)
-                district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
-                subgrads.append(subgrad)
-            
-            # Multi-cut Benders: Generate cuts for ALL active districts
-            cuts_added = 0
-            worst_cost = 0.0  # Track the maximum district cost for upper bound
-            
-            # Generate a Benders cut for each active district
-            for cost, root, assigned_blocks, subgrad, x_star_dist, T_star_dist, alpha_i_dist, subgrad_K_i_dist, subgrad_F_i_dist in district_costs:
-                # Update worst cost for upper bound calculation
-                worst_cost = max(worst_cost, cost)
+                    # Get the values that were actually passed to this district's subproblem
+                    K_i_prev = K_sol[root]  # K_i value passed to subproblem
+                    district_omega_prev = omega_sol[root]
+                    F_i_prev = J_function(district_omega_prev)  # F_i value passed to subproblem
                 
-                # Get the values that were actually passed to this district's subproblem
-                K_i_prev = K_sol[root]  # K_i value passed to subproblem
-                district_omega_prev = omega_sol[root]
-                F_i_prev = J_function(district_omega_prev)  # F_i value passed to subproblem
+                    # 1. Coefficients and RHS values for partition variables z_ji
+                    cut_coeffs_z = {}
+                    cut_rhs_val_z = 0.0
+                    for j in range(N):
+                        g_j = subgrad.get(block_ids[j], 0.0)
+                        if g_j != 0.0:
+                            cut_coeffs_z[j, root] = g_j
+                            # Use the z value that was passed to the subproblem (current master solution)
+                            cut_rhs_val_z += g_j * z_sol[j, root]
                 
-                # 1. Coefficients and RHS values for partition variables z_ji
-                cut_coeffs_z = {}
-                cut_rhs_val_z = 0.0
-                for j in range(N):
-                    g_j = subgrad.get(block_ids[j], 0.0)
-                    if g_j != 0.0:
-                        cut_coeffs_z[j, root] = g_j
-                        # Use the z value that was passed to the subproblem (current master solution)
-                        cut_rhs_val_z += g_j * z_sol[j, root]
+                    # 2. Coefficients and RHS values for linehaul cost K_i and ODD cost F_i
+                    K_coeff = subgrad_K_i_dist  # ∂g/∂K_i
+                    F_coeff = subgrad_F_i_dist  # ∂g/∂F_i
                 
-                # 2. Coefficients and RHS values for linehaul cost K_i and ODD cost F_i
-                K_coeff = subgrad_K_i_dist  # ∂g/∂K_i
-                F_coeff = subgrad_F_i_dist  # ∂g/∂F_i
+                    # 3. Calculate constant term correctly for Benders cut
+                    # The cut is: o >= c* + g_z*(z - z*) + g_K*(K - K*) + g_F*(F - F*)
+                    # Which becomes: o >= (c* - g_z*z* - g_K*K* - g_F*F*) + g_z*z + g_K*K + g_F*F
+                    # So the constant term is: c* - g_z*z* - g_K*K* - g_F*F*
+                    cut_rhs_val_K = K_coeff * K_i_prev if K_coeff != 0 else 0.0
+                    cut_rhs_val_F = F_coeff * F_i_prev if F_coeff != 0 else 0.0
+                    cut_constant = cost - cut_rhs_val_z - cut_rhs_val_K - cut_rhs_val_F
                 
-                # 3. Calculate constant term correctly for Benders cut
-                # The cut is: o >= c* + g_z*(z - z*) + g_K*(K - K*) + g_F*(F - F*)
-                # Which becomes: o >= (c* - g_z*z* - g_K*K* - g_F*F*) + g_z*z + g_K*K + g_F*F
-                # So the constant term is: c* - g_z*z* - g_K*K* - g_F*F*
-                cut_rhs_val_K = K_coeff * K_i_prev if K_coeff != 0 else 0.0
-                cut_rhs_val_F = F_coeff * F_i_prev if F_coeff != 0 else 0.0
-                cut_constant = cost - cut_rhs_val_z - cut_rhs_val_K - cut_rhs_val_F
+                    # 4. Store complete cut information (z coefficients, K coefficient, F coefficient)
+                    cut_info = {
+                        'constant': cut_constant,
+                        'z_coeffs': cut_coeffs_z,
+                        'K_coeff': K_coeff,
+                        'F_coeff': F_coeff,
+                        'district': root,
+                        'id': cut_id_counter
+                    }
+                    cuts.append(cut_info)
                 
-                # 4. Store complete cut information (z coefficients, K coefficient, F coefficient)
-                cut_info = {
-                    'constant': cut_constant,
-                    'z_coeffs': cut_coeffs_z,
-                    'K_coeff': K_coeff,
-                    'F_coeff': F_coeff,
-                    'district': root,
-                    'id': cut_id_counter
-                }
-                cuts.append(cut_info)
+                    if verbose:
+                        z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j, i), v in cut_coeffs_z.items()])
+                        K_term = f" + {K_coeff:.4f}*K[{root}]" if K_coeff != 0 else ""
+                        F_term = f" + {F_coeff:.4f}*F[{root}]" if F_coeff != 0 else ""
+                        print(f"  [DEBUG] Will add cut_{cut_id_counter} next iter: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
                 
-                if verbose:
-                    z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j, i), v in cut_coeffs_z.items()])
-                    K_term = f" + {K_coeff:.4f}*K[{root}]" if K_coeff != 0 else ""
-                    F_term = f" + {F_coeff:.4f}*F[{root}]" if F_coeff != 0 else ""
-                    print(f"  [DEBUG] Will add cut_{cut_id_counter} next iter: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
-                
-                cut_id_counter += 1
-                cuts_added += 1
+                    cut_id_counter += 1
+                    cuts_added += 1
             
             if verbose:
                 print(f"  Total cuts generated this iter: {cuts_added} (multi-cut approach for all {len(district_costs)} active districts)")
+                print(f"  [DEBUG] Reached cut generation end - cuts will be added next iteration")
+            
             # Lower bound is the optimal objective value of the master problem
             lower_bound = master.objVal
             upper_bound = min(upper_bound, worst_cost)
+            if verbose:
+                print(f"  [DEBUG] Bounds calculated: LB={lower_bound:.4f}, UB={upper_bound:.4f}, Gap={upper_bound-lower_bound:.4f}")
             
             # Debug: Check why lower bound might be 0
             if verbose and lower_bound == 0.0:
@@ -909,8 +996,11 @@ class Partition:
                 'district_costs': district_costs
             })
             iteration += 1
+            
         if verbose:
             print("\nBenders decomposition finished.")
+            if parallel:
+                print("✅ Parallel subproblem solving enabled")
             print(f"Best cost: {best_cost:.4f}")
             print(f"Best depot: {best_depot}")
         
