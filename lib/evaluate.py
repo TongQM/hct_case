@@ -487,7 +487,7 @@ class Evaluate:
         # Integrate the square root of the probability mass on the district, we use the vanilla implementation which can be optimized via
         # the optimal objective value obatined from get_tsp_worst_distributions
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
-        # Get the optimal dispatch interval using 1-D minimization as in Partition._SDP_benders
+        # Get the optimal dispatch interval using 1-D minimization as in Partition._CQCP_benders
         Tmin = 1e-3
         Tmax = max_dipatch_interval  # Use argument as the upper bound for search
         grid_points = 20

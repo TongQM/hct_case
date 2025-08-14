@@ -1,0 +1,71 @@
+\ Model benders_master_copy
+\ LP format - for model browsing. Use MPS format to capture full model detail.
+Minimize
+ 
+Subject To
+ one_depot: depot[0] + depot[1] + depot[2] + depot[3] + depot[4] + depot[5]
+   + depot[6] + depot[7] + depot[8] + depot[9] + depot[10] + depot[11]
+   + depot[12] + depot[13] + depot[14] + depot[15] + depot[16] + depot[17]
+   + depot[18] + depot[19] + depot[20] + depot[21] + depot[22] + depot[23]
+   + depot[24] = 1
+ num_districts: assignment[0,0] + assignment[1,1] + assignment[2,2]
+   + assignment[3,3] + assignment[4,4] + assignment[5,5] + assignment[6,6]
+   + assignment[7,7] + assignment[8,8] + assignment[9,9]
+   + assignment[10,10] + assignment[11,11] + assignment[12,12]
+   + assignment[13,13] + assignment[14,14] + assignment[15,15]
+   + assignment[16,16] + assignment[17,17] + assignment[18,18]
+   + assignment[19,19] + assignment[20,20] + assignment[21,21]
+   + assignment[22,22] + assignment[23,23] + assignment[24,24] = 3
+ linehaul_cost_BLK07: - 12 depot[0] - 8 depot[1] - 4 depot[2] - 8 depot[3]
+   - 12 depot[4] - 8 depot[5] - 4 depot[6] - 4 depot[8] - 8 depot[9]
+   - 12 depot[10] - 8 depot[11] - 4 depot[12] - 8 depot[13] - 12 depot[14]
+   - 16 depot[15] - 12 depot[16] - 8 depot[17] - 12 depot[18]
+   - 16 depot[19] - 20 depot[20] - 16 depot[21] - 12 depot[22]
+   - 16 depot[23] - 20 depot[24] + K[7] = 0
+ linehaul_cost_BLK08: - 16 depot[0] - 12 depot[1] - 8 depot[2] - 4 depot[3]
+   - 8 depot[4] - 12 depot[5] - 8 depot[6] - 4 depot[7] - 4 depot[9]
+   - 16 depot[10] - 12 depot[11] - 8 depot[12] - 4 depot[13] - 8 depot[14]
+   - 20 depot[15] - 16 depot[16] - 12 depot[17] - 8 depot[18]
+   - 12 depot[19] - 24 depot[20] - 20 depot[21] - 16 depot[22]
+   - 12 depot[23] - 16 depot[24] + K[8] = 0
+ linehaul_cost_BLK17: - 20 depot[0] - 16 depot[1] - 12 depot[2]
+   - 16 depot[3] - 20 depot[4] - 16 depot[5] - 12 depot[6] - 8 depot[7]
+   - 12 depot[8] - 16 depot[9] - 12 depot[10] - 8 depot[11] - 4 depot[12]
+   - 8 depot[13] - 12 depot[14] - 8 depot[15] - 4 depot[16] - 4 depot[18]
+   - 8 depot[19] - 12 depot[20] - 8 depot[21] - 4 depot[22] - 8 depot[23]
+   - 12 depot[24] + K[17] = 0
+ linehaul_cost_BLK20: - 16 depot[0] - 20 depot[1] - 24 depot[2]
+   - 28 depot[3] - 32 depot[4] - 12 depot[5] - 16 depot[6] - 20 depot[7]
+   - 24 depot[8] - 28 depot[9] - 8 depot[10] - 12 depot[11] - 16 depot[12]
+   - 20 depot[13] - 24 depot[14] - 4 depot[15] - 8 depot[16] - 12 depot[17]
+   - 16 depot[18] - 20 depot[19] - 4 depot[21] - 8 depot[22] - 12 depot[23]
+   - 16 depot[24] + K[20] = 0
+ linehaul_cost_BLK22: - 24 depot[0] - 20 depot[1] - 16 depot[2]
+   - 20 depot[3] - 24 depot[4] - 20 depot[5] - 16 depot[6] - 12 depot[7]
+   - 16 depot[8] - 20 depot[9] - 16 depot[10] - 12 depot[11] - 8 depot[12]
+   - 12 depot[13] - 16 depot[14] - 12 depot[15] - 8 depot[16] - 4 depot[17]
+   - 8 depot[18] - 12 depot[19] - 8 depot[20] - 4 depot[21] - 4 depot[23]
+   - 8 depot[24] + K[22] = 0
+ logical_K_7: - 1000 assignment[7,7] + K[7] <= 0
+ logical_K_8: - 1000 assignment[8,8] + K[8] <= 0
+ logical_K_17: - 1000 assignment[17,17] + K[17] <= 0
+ logical_K_20: - 1000 assignment[20,20] + K[20] <= 0
+ logical_K_22: - 1000 assignment[22,22] + K[22] <= 0
+Bounds
+ K[7] free
+ K[8] free
+ K[17] free
+ K[20] free
+ K[22] free
+Binaries
+ assignment[0,0] assignment[1,1] assignment[2,2] assignment[3,3]
+ assignment[4,4] assignment[5,5] assignment[6,6] assignment[7,7]
+ assignment[8,8] assignment[9,9] assignment[10,10] assignment[11,11]
+ assignment[12,12] assignment[13,13] assignment[14,14] assignment[15,15]
+ assignment[16,16] assignment[17,17] assignment[18,18] assignment[19,19]
+ assignment[20,20] assignment[21,21] assignment[22,22] assignment[23,23]
+ assignment[24,24] depot[0] depot[1] depot[2] depot[3] depot[4] depot[5]
+ depot[6] depot[7] depot[8] depot[9] depot[10] depot[11] depot[12]
+ depot[13] depot[14] depot[15] depot[16] depot[17] depot[18] depot[19]
+ depot[20] depot[21] depot[22] depot[23] depot[24]
+End

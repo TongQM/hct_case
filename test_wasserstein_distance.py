@@ -143,12 +143,19 @@ class WassersteinTester:
         """
         Generate empirical distribution by sampling from true distribution with appearance probabilities.
         
+        Mathematical formulation:
+        1. Sample n_samples points according to true_distribution p
+        2. Each sampled point appears independently with probability appearance_prob
+        3. Empirical distribution: p̂_i = C_i / (total_appeared_samples)
+        
+        This is the standard unbiased empirical distribution estimator.
+        
         Parameters:
         - n_samples: Number of samples to draw
         - appearance_prob: Probability that each sampled point actually appears
         
         Returns:
-        - Empirical distribution (normalized)
+        - Empirical distribution (properly normalized probability distribution)
         """
         # Sample points according to true distribution
         sampled_indices = np.random.choice(
@@ -168,14 +175,15 @@ class WassersteinTester:
         for idx in appeared_indices:
             empirical_counts[idx] += 1
         
-        # Normalize to get empirical distribution
-        if np.sum(empirical_counts) == 0:
+        # Standard empirical distribution: normalize by total appeared samples
+        total_appeared = len(appeared_indices)
+        if total_appeared > 0:
+            empirical_distribution = empirical_counts / total_appeared
+        else:
             # If no points appeared, return uniform distribution
             empirical_distribution = np.ones(self.n_points) / self.n_points
-        else:
-            empirical_distribution = empirical_counts / np.sum(empirical_counts)
         
-        logger.debug(f"Generated empirical distribution from {len(appeared_indices)} appeared points out of {n_samples} samples")
+        logger.debug(f"Generated empirical distribution from {total_appeared} appeared points out of {n_samples} samples")
         return empirical_distribution
     
     def compute_wasserstein_distance(self, empirical_dist: np.ndarray) -> float:
@@ -328,7 +336,7 @@ def main():
     n_points = 50
     dimension = 2  # Change to 1 for 1D test
     n_samples_list = [50, 100, 200, 500, 1000]
-    appearance_probs = [0.3, 0.5, 0.7, 0.9]
+    appearance_probs = [0.3, 0.5, 0.7, 0.9, 1.0]  # Include normal sampling (no appearance filter)
     n_repetitions = 5
     
     # Create tester
