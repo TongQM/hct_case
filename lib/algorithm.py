@@ -542,12 +542,16 @@ class Partition:
         # Also return subgradients w.r.t. K_i and F_i for master problem
         return best_obj, dict(zip(all_blocks, x_star)), subgrad, C_star, alpha_i, subgrad_K_i, subgrad_F_i
 
-    def benders_decomposition(self, max_iterations=50, tolerance=1e-3, max_cuts=100, verbose=True, 
+    def benders_decomposition(self, max_iterations=50, tolerance=1e-3, verbose=True, 
                             Omega_dict=None, J_function=None):
         """
         Updated LBBD with depot location decisions and partition-dependent costs.
+        Uses multi-cut generation for all active districts (no limit on number of cuts).
         
         Parameters:
+        - max_iterations: maximum number of iterations
+        - tolerance: convergence tolerance for gap between upper and lower bounds
+        - verbose: whether to print debug information
         - Omega_dict: dict mapping block_id to Omega_j (2D ODD feature vector)
         - J_function: function that takes 2D omega_i vector and returns F_i (ODD cost)
         """
@@ -811,66 +815,64 @@ class Partition:
                 district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
                 subgrads.append(subgrad)
             
-            # Note: We don't need artificial cuts here. Instead, we should add logical constraints
-            # in the master problem to ensure K_i = 0 and F_i = 0 when district i is not selected.
-            worst_idx = int(np.argmax([c[0] for c in district_costs]))
-            worst_cost, worst_root, worst_blocks, worst_subgrad, x_star, T_star, alpha_i, worst_subgrad_K_i, worst_subgrad_F_i = district_costs[worst_idx]
-            
-            # Single-cut Benders: Generate a cut ONLY for the worst district
+            # Multi-cut Benders: Generate cuts for ALL active districts
             cuts_added = 0
-            worst_cost, worst_root, worst_assigned_blocks, worst_subgrad, x_star_dist, T_star_dist, alpha_i_dist, subgrad_K_i_dist, subgrad_F_i_dist = district_costs[worst_idx]
+            worst_cost = 0.0  # Track the maximum district cost for upper bound
             
-            # Generate Benders cut for the worst district 
-            # Cut form: θ >= max_district_cost + subgrad_z*(z - z_prev) + subgrad_K*(K_i - K_i_prev) + subgrad_F*(F_i - F_i_prev)
-            
-            # Get the values that were actually passed to the worst district's subproblem
-            K_i_prev = K_sol[worst_root]  # K_i value passed to subproblem
-            district_omega_prev = omega_sol[worst_root]
-            F_i_prev = J_function(district_omega_prev)  # F_i value passed to subproblem
-            
-            # 1. Coefficients and RHS values for partition variables z_ji
-            cut_coeffs_z = {}
-            cut_rhs_val_z = 0.0
-            for j in range(N):
-                g_j = worst_subgrad.get(block_ids[j], 0.0)
-                if g_j != 0.0:
-                    cut_coeffs_z[j, worst_root] = g_j
-                    # Use the z value that was passed to the subproblem (current master solution)
-                    cut_rhs_val_z += g_j * z_sol[j, worst_root]
-            
-            # 2. Coefficients and RHS values for linehaul cost K_i and ODD cost F_i
-            K_coeff = subgrad_K_i_dist  # ∂g/∂K_i
-            F_coeff = subgrad_F_i_dist  # ∂g/∂F_i
-            
-            # 3. Calculate constant term correctly for Benders cut
-            # The cut is: o >= c* + g_z*(z - z*) + g_K*(K - K*) + g_F*(F - F*)
-            # Which becomes: o >= (c* - g_z*z* - g_K*K* - g_F*F*) + g_z*z + g_K*K + g_F*F
-            # So the constant term is: c* - g_z*z* - g_K*K* - g_F*F*
-            cut_rhs_val_K = K_coeff * K_i_prev if K_coeff != 0 else 0.0
-            cut_rhs_val_F = F_coeff * F_i_prev if F_coeff != 0 else 0.0
-            cut_constant = worst_cost - cut_rhs_val_z - cut_rhs_val_K - cut_rhs_val_F
-            
-            # 4. Store complete cut information (z coefficients, K coefficient, F coefficient)
-            cut_info = {
-                'constant': cut_constant,
-                'z_coeffs': cut_coeffs_z,
-                'K_coeff': K_coeff,
-                'F_coeff': F_coeff,
-                'district': worst_root,
-                'id': cut_id_counter
-            }
-            cuts.append(cut_info)
+            # Generate a Benders cut for each active district
+            for cost, root, assigned_blocks, subgrad, x_star_dist, T_star_dist, alpha_i_dist, subgrad_K_i_dist, subgrad_F_i_dist in district_costs:
+                # Update worst cost for upper bound calculation
+                worst_cost = max(worst_cost, cost)
+                
+                # Get the values that were actually passed to this district's subproblem
+                K_i_prev = K_sol[root]  # K_i value passed to subproblem
+                district_omega_prev = omega_sol[root]
+                F_i_prev = J_function(district_omega_prev)  # F_i value passed to subproblem
+                
+                # 1. Coefficients and RHS values for partition variables z_ji
+                cut_coeffs_z = {}
+                cut_rhs_val_z = 0.0
+                for j in range(N):
+                    g_j = subgrad.get(block_ids[j], 0.0)
+                    if g_j != 0.0:
+                        cut_coeffs_z[j, root] = g_j
+                        # Use the z value that was passed to the subproblem (current master solution)
+                        cut_rhs_val_z += g_j * z_sol[j, root]
+                
+                # 2. Coefficients and RHS values for linehaul cost K_i and ODD cost F_i
+                K_coeff = subgrad_K_i_dist  # ∂g/∂K_i
+                F_coeff = subgrad_F_i_dist  # ∂g/∂F_i
+                
+                # 3. Calculate constant term correctly for Benders cut
+                # The cut is: o >= c* + g_z*(z - z*) + g_K*(K - K*) + g_F*(F - F*)
+                # Which becomes: o >= (c* - g_z*z* - g_K*K* - g_F*F*) + g_z*z + g_K*K + g_F*F
+                # So the constant term is: c* - g_z*z* - g_K*K* - g_F*F*
+                cut_rhs_val_K = K_coeff * K_i_prev if K_coeff != 0 else 0.0
+                cut_rhs_val_F = F_coeff * F_i_prev if F_coeff != 0 else 0.0
+                cut_constant = cost - cut_rhs_val_z - cut_rhs_val_K - cut_rhs_val_F
+                
+                # 4. Store complete cut information (z coefficients, K coefficient, F coefficient)
+                cut_info = {
+                    'constant': cut_constant,
+                    'z_coeffs': cut_coeffs_z,
+                    'K_coeff': K_coeff,
+                    'F_coeff': F_coeff,
+                    'district': root,
+                    'id': cut_id_counter
+                }
+                cuts.append(cut_info)
+                
+                if verbose:
+                    z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j, i), v in cut_coeffs_z.items()])
+                    K_term = f" + {K_coeff:.4f}*K[{root}]" if K_coeff != 0 else ""
+                    F_term = f" + {F_coeff:.4f}*F[{root}]" if F_coeff != 0 else ""
+                    print(f"  [DEBUG] Will add cut_{cut_id_counter} next iter: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
+                
+                cut_id_counter += 1
+                cuts_added += 1
             
             if verbose:
-                z_terms = " + ".join([f"{v:.4f}*z[{j},{i}]" for (j, i), v in cut_coeffs_z.items()])
-                K_term = f" + {K_coeff:.4f}*K[{worst_root}]" if K_coeff != 0 else ""
-                F_term = f" + {F_coeff:.4f}*F[{worst_root}]" if F_coeff != 0 else ""
-                print(f"  [DEBUG] Will add cut_{cut_id_counter} next iter: o >= {cut_constant:.4f} + {z_terms}{K_term}{F_term}")
-            
-            cut_id_counter += 1
-            cuts_added += 1
-            if verbose:
-                print(f"  Total cuts generated this iter: {cuts_added} (single-cut approach)")
+                print(f"  Total cuts generated this iter: {cuts_added} (multi-cut approach for all {len(district_costs)} active districts)")
             # Lower bound is the optimal objective value of the master problem
             lower_bound = master.objVal
             upper_bound = min(upper_bound, worst_cost)
