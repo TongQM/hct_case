@@ -197,81 +197,164 @@ class Partition:
                 expanded[j, center_idx_map[block_centers[d]]] = block_assignment[j, d]
         return expanded
 
-    def random_search(self, max_iters=1000, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120):
+    def random_search(self, max_iters=1000, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120, 
+                      Omega_dict=None, J_function=None):
         """
-        Randomized search for the best partition using the real-problem objective.
-        Returns best_block_centers, best_assignment, best_obj_val, best_district_info
+        Enhanced randomized search with depot optimization and ODD cost integration.
+        
+        Parameters:
+        - max_iters: number of random initializations
+        - prob_dict: empirical distribution
+        - Lambda, wr, wv, beta: objective parameters
+        - Omega_dict: block ODD features (optional)
+        - J_function: function to compute F_i from district ODD (optional)
+        
+        Returns: (best_depot, best_block_centers, best_assignment, best_obj_val, best_district_info)
         """
         best_obj_val = float('inf')
+        best_depot = None
         best_block_centers = None
         best_assignment = None
         best_district_info = None
         block_ids = self.short_geoid_list
         N = len(block_ids)
-        for _ in range(max_iters):
+        
+        for iteration in range(max_iters):
+            # Sample both depot and district roots randomly
+            depot_id = np.random.choice(block_ids)
             block_centers = np.random.choice(block_ids, self.num_districts, replace=False)
+            
+            # Iterative assignment and recentering until convergence
             block_assignment = self._Hess_model(block_centers)
             new_centers = self._recenter(block_centers, block_assignment)
             new_centers = [self.short_geoid_list[int(center)] for center in new_centers]
-            cnt = 0
+            
             while sorted(block_centers) != sorted(new_centers):
                 block_centers = new_centers
                 block_assignment = self._Hess_model(block_centers)
                 new_centers = self._recenter(block_centers, block_assignment)
                 new_centers = [self.short_geoid_list[int(center)] for center in new_centers]
-                cnt += 1
+            
+            # Expand assignment matrix if needed
             if block_assignment.shape[1] != N:
                 expanded_assignment = self._expand_assignment_matrix(block_assignment, block_centers)
             else:
                 expanded_assignment = block_assignment
-            obj_val, district_info = self.evaluate_real_objective(expanded_assignment, prob_dict, Lambda, wr, wv, beta)
+            
+            # Optimize depot location for this partition
+            optimized_depot = self.optimize_depot_location(expanded_assignment, block_centers, prob_dict)
+            
+            # Evaluate partition with optimized depot
+            obj_val, district_info = self.evaluate_partition_objective(
+                expanded_assignment, optimized_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+            )
+            
+            # Update best solution
             if obj_val < best_obj_val:
                 best_obj_val = obj_val
+                best_depot = optimized_depot
                 best_block_centers = block_centers
                 best_assignment = expanded_assignment
                 best_district_info = district_info
-        print(f"Best block centers: {best_block_centers}")
-        print(f"Best objective value: {best_obj_val}")
-        return best_block_centers, best_assignment, best_obj_val, best_district_info
+        
+        # Apply enhanced local search to best solution
+        final_depot, final_centers, final_assignment, final_obj_val, final_district_info = self.local_search(
+            best_block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta, 
+            best_depot, Omega_dict, J_function
+        )
+        
+        # Optionally relocate roots to be closest to depot for optimal linehaul costs
+        optimized_assignment, optimized_roots = self.relocate_roots_to_depot_closest(final_assignment, final_depot)
+        
+        # Re-evaluate with optimized root locations
+        optimized_obj_val, optimized_district_info = self.evaluate_partition_objective(
+            optimized_assignment, final_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+        )
+        
+        print(f"Best depot: {final_depot}")
+        print(f"Original centers: {final_centers}")
+        print(f"Optimized roots: {optimized_roots}")
+        print(f"Original objective: {final_obj_val:.4f}")
+        print(f"Optimized objective: {optimized_obj_val:.4f}")
+        print(f"Improvement from root relocation: {final_obj_val - optimized_obj_val:.4f}")
+        
+        return final_depot, optimized_roots, optimized_assignment, optimized_obj_val, optimized_district_info
 
-    def local_search(self, block_centers, best_obj_val, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120):
+    def local_search(self, block_centers, best_obj_val, prob_dict=None, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120, 
+                     depot_id=None, Omega_dict=None, J_function=None):
         """
-        Local search for the best partition using the real-problem objective.
-        Returns best_block_centers, best_assignment, best_obj_val, best_district_info
+        Enhanced local search with depot optimization and ODD cost integration.
+        
+        Parameters:
+        - block_centers: initial district root centers
+        - best_obj_val: current best objective value  
+        - prob_dict: empirical distribution
+        - Lambda, wr, wv, beta: objective parameters
+        - depot_id: depot location (if None, will be optimized)
+        - Omega_dict: block ODD features (optional)
+        - J_function: function to compute F_i from district ODD (optional)
+        
+        Returns: (depot_id, block_centers, assignment, obj_val, district_info)
         """
         block_centers = list(block_centers)
         assert len(block_centers) == self.num_districts, f"Got {len(block_centers)} block centers but expected {self.num_districts} districts"
+        
+        # Get initial assignment
         assignment = self._Hess_model(block_centers)
         N = len(self.short_geoid_list)
         if assignment.shape[1] != N:
             expanded_assignment = self._expand_assignment_matrix(assignment, block_centers)
         else:
             expanded_assignment = assignment
-        obj_val, district_info = self.evaluate_real_objective(expanded_assignment, prob_dict, Lambda, wr, wv, beta)
+        
+        # Optimize depot if not provided
+        if depot_id is None:
+            depot_id = self.optimize_depot_location(expanded_assignment, block_centers, prob_dict)
+        
+        # Evaluate current solution
+        obj_val, district_info = self.evaluate_partition_objective(
+            expanded_assignment, depot_id, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+        )
         print(f"Original objective value: {obj_val}")
+        
+        best_depot = depot_id
         best_assignment = expanded_assignment
         best_obj_val = obj_val
         best_district_info = district_info
+        
+        # Try swapping each center with its neighbors
         for center in block_centers:
             for neighbor in self.geodata.G.neighbors(center):
                 if neighbor not in block_centers:
+                    # Create new center configuration
                     new_centers = list(block_centers.copy())
                     new_centers.remove(center)
                     new_centers.append(neighbor)
+                    
+                    # Get new assignment
                     new_assignment = self._Hess_model(new_centers)
                     if new_assignment.shape[1] != N:
                         expanded_new_assignment = self._expand_assignment_matrix(new_assignment, new_centers)
                     else:
                         expanded_new_assignment = new_assignment
-                    new_obj_val, new_district_info = self.evaluate_real_objective(expanded_new_assignment, prob_dict, Lambda, wr, wv, beta)
+                    
+                    # Optimize depot for new partition
+                    new_depot = self.optimize_depot_location(expanded_new_assignment, new_centers, prob_dict)
+                    
+                    # Evaluate new solution
+                    new_obj_val, new_district_info = self.evaluate_partition_objective(
+                        expanded_new_assignment, new_depot, prob_dict, Lambda, wr, wv, beta, Omega_dict, J_function
+                    )
+                    
+                    # If improvement found, recurse
                     if new_obj_val < best_obj_val:
                         print(f"new obj val: {new_obj_val}")
-                        block_centers = new_centers
-                        best_obj_val = new_obj_val
-                        best_assignment = expanded_new_assignment
-                        best_district_info = new_district_info
-                        return self.local_search(block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta)
-        return block_centers, best_assignment, best_obj_val, best_district_info
+                        return self.local_search(
+                            new_centers, new_obj_val, prob_dict, Lambda, wr, wv, beta, 
+                            new_depot, Omega_dict, J_function
+                        )
+        
+        return best_depot, block_centers, best_assignment, best_obj_val, best_district_info
 
 
     def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False):
@@ -892,40 +975,207 @@ class Partition:
             'final_gap': upper_bound - lower_bound
         }
 
-    def evaluate_real_objective(self, assignment, prob_dict, Lambda, wr, wv, beta=0.7120):
+    def optimize_depot_location(self, assignment, roots, prob_dict):
         """
-        Evaluate the real-problem objective for a given assignment (z matrix):
+        Find optimal depot location by minimizing weighted distance to all district roots.
+        Weight by district demand probability.
+        
+        Parameters:
         - assignment: np.ndarray (N_blocks x N_blocks), z[j, i]=1 if block j assigned to root i
+        - roots: list of root block IDs
+        - prob_dict: empirical distribution for weighting
+        
+        Returns:
+        - best_depot: block ID of optimal depot location
+        """
+        block_ids = self.short_geoid_list
+        N = len(block_ids)
+        best_depot = None
+        best_cost = float('inf')
+        
+        # Calculate district demands for weighting
+        district_demands = {}
+        for root in roots:
+            root_idx = block_ids.index(root)
+            # Sum probability mass of all blocks assigned to this root
+            district_demand = sum(
+                prob_dict.get(block_ids[j], 0.0) 
+                for j in range(N) 
+                if round(assignment[j, root_idx]) == 1
+            )
+            district_demands[root] = district_demand
+        
+        # Find depot minimizing weighted distance to all roots
+        for candidate_depot in block_ids:
+            total_linehaul_cost = sum(
+                self.geodata.get_dist(candidate_depot, root) * district_demands[root]
+                for root in roots
+            )
+            if total_linehaul_cost < best_cost:
+                best_cost = total_linehaul_cost
+                best_depot = candidate_depot
+        
+        return best_depot
+    
+    def relocate_roots_to_depot_closest(self, assignment, depot_id):
+        """
+        Relocate district roots to be the closest blocks to the depot in each district.
+        This optimizes linehaul costs for the final solution.
+        
+        Parameters:
+        - assignment: np.ndarray (N_blocks x N_blocks), z[j, i]=1 if block j assigned to root i
+        - depot_id: depot location
+        
+        Returns:
+        - new_assignment: updated assignment matrix with relocated roots
+        - new_roots: list of new root block IDs
+        """
+        block_ids = self.short_geoid_list
+        N = len(block_ids)
+        new_assignment = np.zeros((N, N))
+        new_roots = []
+        
+        # Find current districts and their assigned blocks
+        current_districts = []
+        for i, root_id in enumerate(block_ids):
+            if round(assignment[i, i]) == 1:  # This is a current root
+                assigned_blocks = [j for j in range(N) if round(assignment[j, i]) == 1]
+                current_districts.append((i, root_id, assigned_blocks))
+        
+        # For each district, find the block closest to depot and make it the new root
+        for old_root_idx, old_root_id, assigned_blocks in current_districts:
+            # Find block closest to depot within this district
+            best_dist = float('inf')
+            new_root_idx = old_root_idx  # fallback
+            
+            for j in assigned_blocks:
+                dist_to_depot = self.geodata.get_dist(depot_id, block_ids[j])
+                if dist_to_depot < best_dist:
+                    best_dist = dist_to_depot
+                    new_root_idx = j
+            
+            new_root_id = block_ids[new_root_idx]
+            new_roots.append(new_root_id)
+            
+            # Assign all blocks in this district to the new root
+            for j in assigned_blocks:
+                new_assignment[j, new_root_idx] = 1
+        
+        return new_assignment, new_roots
+    
+    def compute_district_odd_features(self, assignment, Omega_dict):
+        """
+        Compute district-level ODD feature vectors as element-wise maximum
+        of assigned blocks' ODD features.
+        
+        Parameters:
+        - assignment: np.ndarray (N_blocks x N_blocks), z[j, i]=1 if block j assigned to root i  
+        - Omega_dict: dict mapping block_id to ODD feature vector
+        
+        Returns:
+        - district_omega_dict: dict mapping root_id to district ODD vector
+        """
+        block_ids = self.short_geoid_list
+        N = len(block_ids)
+        district_omega_dict = {}
+        
+        # Get first ODD vector to determine dimensionality
+        first_omega = next(iter(Omega_dict.values()))
+        odd_dim = len(first_omega) if hasattr(first_omega, '__len__') else 1
+        
+        for i, root_id in enumerate(block_ids):
+            if round(assignment[i, i]) == 1:  # This is a root
+                # Get all blocks assigned to this district
+                assigned_blocks = [
+                    block_ids[j] for j in range(N) 
+                    if round(assignment[j, i]) == 1
+                ]
+                
+                # Compute element-wise maximum ODD vector
+                if odd_dim >= 2:
+                    district_omega = np.zeros(odd_dim)
+                    for block_id in assigned_blocks:
+                        block_omega = Omega_dict.get(block_id, np.zeros(odd_dim))
+                        district_omega = np.maximum(district_omega, block_omega)
+                else:
+                    district_omega = max(
+                        Omega_dict.get(block_id, 0.0) 
+                        for block_id in assigned_blocks
+                    )
+                
+                district_omega_dict[root_id] = district_omega
+        
+        return district_omega_dict
+
+    def evaluate_partition_objective(self, assignment, depot_id, prob_dict, Lambda, wr, wv, beta=0.7120, Omega_dict=None, J_function=None):
+        """
+        Evaluate the real-problem objective for a given assignment with depot location.
+        Enhanced version that properly handles depot location and ODD costs.
+        
+        Parameters:
+        - assignment: np.ndarray (N_blocks x N_blocks), z[j, i]=1 if block j assigned to root i
+        - depot_id: block ID of depot location
         - prob_dict: empirical distribution
         - Lambda, wr, wv: parameters for the objective
         - beta: risk parameter (default 0.7120)
-        Returns: max district cost, list of tuples (district_obj, root, K_i, T_star)
+        - Omega_dict: dict mapping block_id to ODD feature vector (optional)
+        - J_function: function to compute F_i from district ODD vector (optional)
+        
+        Returns: max district cost, list of tuples (district_obj, root, K_i, F_i, T_star)
         """
         block_ids = self.short_geoid_list
         N = len(block_ids)
         epsilon = self.epsilon
         district_info = []
+        
+        # Compute district ODD features if provided
+        district_omega_dict = {}
+        if Omega_dict is not None and J_function is not None:
+            district_omega_dict = self.compute_district_odd_features(assignment, Omega_dict)
+        
         for i, root in enumerate(block_ids):
             # Get assigned blocks for this root
             assigned = [j for j in range(N) if round(assignment[j, i]) == 1]
             if not assigned or round(assignment[i, i]) != 1:
                 continue  # skip if not a root or no blocks assigned
+            
             assigned_blocks = [block_ids[j] for j in assigned]
-            # CQCP inner maximization
-            cost, x_star, _, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(assigned_blocks, root, prob_dict, epsilon)
-            # Get K_i for the root
-            K_i = float(self.geodata.get_K(root))
-            # F_i = 0
-            F_i = 0.0
-            # C_i = sqrt(T_star)
-            C_i = np.sqrt(T_star) if T_star is not None else 1.0
-            # Compute the full objective as in (8a)
-            term1 = (K_i + F_i) / C_i
-            term2 = beta * np.sqrt(Lambda / C_i) * alpha_i
-            term3 = wr * (1/wv * (K_i/2 + beta * np.sqrt(Lambda * C_i) * alpha_i) + C_i)
-            district_obj = term1 + term2 + term3
-            district_info.append((district_obj, root, K_i, T_star))
+            
+            # Compute partition-dependent costs
+            # K_i: linehaul cost from depot to closest point in district (not necessarily root)
+            # This is more realistic since roots aren't optimally positioned in heuristics
+            min_depot_to_district_dist = min(
+                self.geodata.get_dist(depot_id, block_ids[j]) 
+                for j in assigned
+            )
+            K_i = min_depot_to_district_dist  # Distance-based linehaul cost to closest block
+            
+            # F_i: ODD cost based on district ODD features
+            if root in district_omega_dict:
+                F_i = J_function(district_omega_dict[root])
+            else:
+                F_i = 0.0  # Fallback if no ODD features provided
+            
+            # CQCP inner maximization with updated costs
+            cost, x_star, _, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
+                assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i
+            )
+            
+            district_info.append((cost, root, K_i, F_i, T_star))
+        
         if not district_info:
             return float('inf'), []
+        
         max_cost = max([info[0] for info in district_info])
         return max_cost, district_info
+
+    # Keep old method for backward compatibility
+    def evaluate_real_objective(self, assignment, prob_dict, Lambda, wr, wv, beta=0.7120):
+        """
+        Legacy method for backward compatibility. 
+        Uses a default depot (first block) and no ODD features.
+        """
+        default_depot = self.short_geoid_list[0]
+        return self.evaluate_partition_objective(
+            assignment, default_depot, prob_dict, Lambda, wr, wv, beta
+        )
