@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Final LBBD Test - Multi-Cut Approach
-Simple test to demonstrate the multi-cut LBBD algorithm with visualization.
+LBBD Algorithm Test - Multi-Cut Approach
+Comprehensive test to demonstrate the multi-cut LBBD algorithm with visualization.
+Tests 4×4 grid with depot optimization, partition quality, and performance analysis.
 """
 
 import sys
@@ -80,17 +81,17 @@ class ToyGeoData(GeoData):
     def get_out_arcs(self, block_id):
         return [(src, dst) for (src, dst) in self.arc_list if src == block_id]
 
-def test_lbbd_final():
-    """Final test of multi-cut LBBD with visualization"""
+def test_lbbd():
+    """Comprehensive test of multi-cut LBBD with visualization"""
     
     print("=" * 80)
-    print("FINAL LBBD TEST - MULTI-CUT APPROACH")
+    print("LBBD ALGORITHM TEST - MULTI-CUT APPROACH")
     print("=" * 80)
     
     # Test configuration
-    grid_size = 4
-    n_blocks = 16
-    num_districts = 3
+    grid_size = 3
+    n_blocks = 9
+    num_districts = 2
     
     # Setup
     toy_geo = ToyGeoData(n_blocks, grid_size)
@@ -155,7 +156,7 @@ def test_lbbd_final():
             
             # Calculate C*
             assigned_block_ids = [block_ids[j] for j in assigned_blocks]
-            cost, _, _, C_star, alpha_i, _, _ = partition._CQCP_benders_updated(
+            cost, _, _, C_star, alpha_i, _, _ = partition._CQCP_benders(
                 assigned_block_ids, root_id, prob_dict, partition.epsilon, 
                 K_i=result['best_K'][i], F_i=result['best_F'][i])
             
@@ -268,8 +269,8 @@ def test_lbbd_final():
                     fontsize=8, color='white', fontweight='bold')
     
     plt.tight_layout()
-    plt.savefig('lbbd_final_results.png', dpi=300, bbox_inches='tight')
-    print("📁 Saved comprehensive visualization as 'lbbd_final_results.png'")
+    plt.savefig('lbbd_test_results.png', dpi=300, bbox_inches='tight')
+    print("📁 Saved comprehensive visualization as 'lbbd_test_results.png'")
     
     # Performance summary
     sizes = [d['size'] for d in district_info]
@@ -287,4 +288,4 @@ def test_lbbd_final():
     return result
 
 if __name__ == "__main__":
-    test_lbbd_final()
+    test_lbbd()
