@@ -273,145 +273,8 @@ class Partition:
                         return self.local_search(block_centers, best_obj_val, prob_dict, Lambda, wr, wv, beta)
         return block_centers, best_assignment, best_obj_val, best_district_info
 
-    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, grid_points=20, beta=None, Lambda=None):
-        """
-        Solve the inner CQCP for a district (for Benders decomposition):
-        - assigned_blocks: list of block IDs assigned to this district
-        - root: the root block ID (must be in assigned_blocks)
-        - prob_dict: probability mass for each block in the entire service region
-        - epsilon: Wasserstein radius
-        Returns:
-            - worst-case cost (float)
-            - optimal mass x_j^* for each block (dict)
-            - subgradient components (g_alpha, g_K, etc.)
-            - T_star (optimal dispatch interval)
-            - alpha_i (sum of x^*_j for assigned blocks)
-        
-        Note: The SDP is formulated over the ENTIRE service region, but only assigned blocks
-        contribute to the objective function through the assignment indicators z_ji.
-        """
-        # Use ALL blocks in the service region for the CQCP formulation
-        all_blocks = self.short_geoid_list
-        N = len(all_blocks)
-        
-        # Create assignment indicator: z_ji = 1 if block j is assigned to this district
-        z_assignment = np.zeros(N)
-        for j, block_id in enumerate(all_blocks):
-            if block_id in assigned_blocks:
-                z_assignment[j] = 1.0
-        
-        # Use precomputed distance matrix (much faster!)
-        cost_matrix = self.distance_matrix
-        
-        # Empirical distribution over ALL blocks
-        p = np.array([prob_dict.get(bi, 0.0) for bi in all_blocks])
-        
-        # Use precomputed area vector
-        area_vec = self.area_vector
-        
-        # SDP: maximize sum of x_j * sqrt(area_j) * z_ji (only assigned blocks contribute)
-        model = gp.Model("worst_case_qcp")
-        x = model.addVars(N, lb=0.0, name="x")
-        y = model.addVars(N, N, lb=0.0, name='y')
-        
-        # Objective: only assigned blocks contribute (multiply by z_assignment)
-        model.setObjective(gp.quicksum(x[j] * np.sqrt(area_vec[j]) * z_assignment[j] for j in range(N)), gp.GRB.MAXIMIZE)
-        
-        # Constraints over ALL blocks
-        # Quadratic constraint: sum of x_j^2 <= 1
-        model.addQConstr(gp.quicksum(x[j] * x[j] for j in range(N)) <= 1, name="quad_constraint")
-        
-        # Mass conservation: sum_l y_jl = m_j for all j
-        model.addConstrs((gp.quicksum(y[j, l] for l in range(N)) == p[j] for j in range(N)), name='mass_conservation')
-        
-        # Coupling constraint: sum_j y_jl >= x_l^2 for all l
-        for l in range(N):
-            model.addQConstr((gp.quicksum(y[j, l] for j in range(N)) >= x[l] * x[l]), name=f'coupling_{l}')
-        
-        # Wasserstein constraint: sum_{j,l} d_jl * y_jl <= epsilon
-        model.addConstr(gp.quicksum(cost_matrix[j, l] * y[j, l] for j in range(N) for l in range(N)) <= epsilon, name='wasserstein')
-        
-        model.setParam('OutputFlag', 0)
-        model.optimize()
-        
-        if model.status != gp.GRB.OPTIMAL:
-            logging.warning("SDP infeasible or not optimal!")
-            return float('inf'), {bi: 0.0 for bi in all_blocks}, {bi: 0.0 for bi in all_blocks}, None, 0.0
-        
-        # Extract solution
-        x_star = np.array([x[j].X for j in range(N)])
-        
-        # alpha_i is the optimal objective value of the CQCP with BHH coefficient: 
-        # α_i = β * √Λ * Σ x_j * sqrt(area_j) * z_ji
-        # Get BHH coefficient β and overall arrival rate Λ
-        if beta is None:
-            beta = getattr(self.geodata, 'beta', 0.7120)  # Default BHH coefficient
-        if Lambda is None:
-            Lambda = getattr(self.geodata, 'Lambda', 30.0)  # Default overall arrival rate
-        
-        # Raw alpha without BHH factors
-        raw_alpha = np.sum(x_star * np.sqrt(area_vec) * z_assignment)
-        # Apply BHH coefficient: α_i = β * √Λ * raw_alpha
-        alpha_i = beta * np.sqrt(Lambda) * raw_alpha
-        # Note: model.objVal gives raw_alpha, not the BHH-adjusted alpha_i
-        
-        # Retrieve K_i, F_i from GeoData instance
-        try:
-            K_i = float(self.geodata.get_K(root))
-        except AttributeError:
-            K_i = 0.0
-            # logging.warning(f"GeoData missing get_K for block {root}, using K_i={K_i}")
-        try:
-            F_i = float(self.geodata.get_F(root))
-        except AttributeError:
-            F_i = 0.0
-            # logging.warning(f"GeoData missing get_F for block {root}, using F_i={F_i}")
-        
-        wr = getattr(self.geodata, 'wr', 1.0)
-        wv = getattr(self.geodata, 'wv', 10.0)
-        
-        # 1-D minimization in T (dispatch interval)
-        Tmin = 1e-3
-        Tmax = 10.0
-        best_T = Tmin
-        best_obj = float('inf')
-        for T in np.linspace(Tmin, Tmax, grid_points):
-            ci = np.sqrt(T)
-            g_bar = (K_i+F_i)*ci**-2 + alpha_i*ci**-1 + wr/(2*wv)*K_i + wr/wv*alpha_i*ci + wr*ci**2
-            if g_bar < best_obj:
-                best_obj = g_bar
-                best_T = T
-        
-        T_star = best_T
-        ci_star = np.sqrt(T_star)
-        g_alpha = ci_star**-1 + wr/wv*ci_star
-        g_K = ci_star**-2 + wr/(2*wv)
-        g_F = ci_star**-2
-        
-        # Subgradient: g_j for ALL blocks (not just assigned ones)
-        # Since α_i = β * √Λ * Σ x_j * sqrt(area_j) * z_ji,
-        # the subgradient w.r.t. z_ji is: ∂α_i/∂z_ji = β * √Λ * x_j^* * sqrt(area_j)
-        subgrad = {}
-        for j, bi in enumerate(all_blocks):
-            area_j = self.geodata.get_area(bi)
-            sqrt_area_j = np.sqrt(area_j)
-            # Include BHH factors in subgradient
-            dalpha_dzji = beta * np.sqrt(Lambda) * x_star[j] * sqrt_area_j
-            if bi == root:
-                subgrad[bi] = g_alpha * dalpha_dzji + ((K_i + F_i) * ci_star**-2 + wr/(2*wv) * K_i + wr * ci_star**2)
-            else:
-                subgrad[bi] = g_alpha * dalpha_dzji
-        
-        logging.info(f"CQCP district root {root}: cost={best_obj:.4f}, alpha={alpha_i:.4f}, T*={T_star:.4f}")
-        
-        # Return x_star for ALL blocks (not just assigned ones)
-        # Also return subgradients w.r.t. K_i and F_i for master problem
-        subgrad_K_i = g_K  # ∂g/∂K_i = ci_star**-2 + wr/(2*wv)
-        subgrad_F_i = g_F  # ∂g/∂F_i = ci_star**-2
-        
-        return best_obj, dict(zip(all_blocks, x_star)), subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i
 
-    def _CQCP_benders_updated(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False):
+    def _CQCP_benders(self, assigned_blocks, root, prob_dict, epsilon, K_i, F_i, grid_points=20, beta=None, Lambda=None, single_threaded=False):
         """
         Updated CQCP subproblem that accepts partition-dependent costs K_i and F_i as parameters.
         
@@ -556,7 +419,7 @@ class Partition:
         actual_F_i = J_function(omega_sol)
         
         # Call subproblem solver with thread-safe flag
-        return self._CQCP_benders_updated(
+        return self._CQCP_benders(
             assigned_block_ids, root_id, prob_dict, epsilon, 
             K_i=K_i, F_i=actual_F_i, single_threaded=True
         )
@@ -900,7 +763,7 @@ class Partition:
                     district_omega = omega_sol[root]
                     actual_F_i = J_function(district_omega)
                 
-                    cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders_updated(
+                    cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
                         [block_ids[j] for j in assigned_blocks], block_ids[root], 
                         self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i)
                     district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
