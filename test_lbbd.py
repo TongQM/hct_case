@@ -131,7 +131,7 @@ def test_lbbd():
     result = partition.benders_decomposition(
         max_iterations=100,  # Limited iterations for speed
         tolerance=1e-2,
-        verbose=True,
+        verbose=False,
         Omega_dict=Omega_dict,
         J_function=J_function,
         parallel=True

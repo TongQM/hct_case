@@ -1005,12 +1005,22 @@ class Partition:
             )
             district_demands[root] = district_demand
         
-        # Find depot minimizing weighted distance to all roots
+        # Find depot minimizing weighted distance to closest block in each district
+        # This matches the actual linehaul cost calculation in evaluate_partition_objective
         for candidate_depot in block_ids:
-            total_linehaul_cost = sum(
-                self.geodata.get_dist(candidate_depot, root) * district_demands[root]
-                for root in roots
-            )
+            total_linehaul_cost = 0.0
+            for root in roots:
+                root_idx = block_ids.index(root)
+                # Get all blocks assigned to this district
+                assigned_blocks = [j for j in range(N) if round(assignment[j, root_idx]) == 1]
+                if assigned_blocks:
+                    # Find closest block to candidate depot in this district
+                    min_dist_to_district = min(
+                        self.geodata.get_dist(candidate_depot, block_ids[j]) 
+                        for j in assigned_blocks
+                    )
+                    total_linehaul_cost += min_dist_to_district * district_demands[root]
+            
             if total_linehaul_cost < best_cost:
                 best_cost = total_linehaul_cost
                 best_depot = candidate_depot
