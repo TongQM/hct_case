@@ -1171,7 +1171,7 @@ class Partition:
                 assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i
             )
             
-            district_info.append((cost, root, K_i, F_i, T_star))
+            district_info.append((cost, root, K_i, F_i, T_star, x_star))
         
         if not district_info:
             return float('inf'), []
