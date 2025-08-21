@@ -254,18 +254,18 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
             # Convert to miles coordinates
             x_block = j * miles_per_block
             y_block = i * miles_per_block
-            bar_width = miles_per_block * 0.15
+            bar_width = miles_per_block * 0.12
             
-            # Feature 1 bar (left side of block)
+            # Feature 1 bar (left bar, closer to center)
             bar_height1 = (omega[0] / max_omega) * miles_per_block * 0.8
-            rect1 = Rectangle((x_block + miles_per_block * 0.05, y_block + miles_per_block * 0.1), 
+            rect1 = Rectangle((x_block + miles_per_block * 0.35, y_block + miles_per_block * 0.1), 
                             bar_width, bar_height1, 
                             facecolor='gray', edgecolor='black', linewidth=0.5)
             ax1.add_patch(rect1)
             
-            # Feature 2 bar (right side of block)  
+            # Feature 2 bar (right bar, closer to center)  
             bar_height2 = (omega[1] / max_omega) * miles_per_block * 0.8
-            rect2 = Rectangle((x_block + miles_per_block * 0.8, y_block + miles_per_block * 0.1), 
+            rect2 = Rectangle((x_block + miles_per_block * 0.53, y_block + miles_per_block * 0.1), 
                             bar_width, bar_height2,
                             facecolor='darkgray', edgecolor='black', linewidth=0.5)
             ax1.add_patch(rect2)
@@ -295,12 +295,21 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     ax1.set_ylim(0, service_region_miles)
     ax1.set_xlabel('x (miles)')
     ax1.set_ylabel('y (miles)')
-    ax1.set_title('Optimal Service Design')
     ax1.grid(True, alpha=0.3)
     
     # Add colorbar for demand
     cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
     cbar1.set_label('Demand density (nominal)')
+    
+    # Add legend for left panel
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='red', label='Depot'),
+        Patch(facecolor='gray', label='ODD feature 1'),
+        Patch(facecolor='darkgray', label='ODD feature 2'),
+        Patch(facecolor='black', alpha=0.7, label='Dispatch intervals')
+    ]
+    ax1.legend(handles=legend_elements, loc='upper right')
     
     # === RIGHT PANEL: Demand Distributions ===
     
@@ -372,7 +381,6 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     ax2.set_ylim(0, service_region_miles)
     ax2.set_xlabel('x (miles)')
     ax2.set_ylabel('y (miles)')
-    ax2.set_title('Empirical vs Worst-Case Distribution')
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     
@@ -405,7 +413,7 @@ def main():
     print(f"Sample probabilities: {sample_probs}")
     
     print("Creating partition instance and running Random Search...")
-    partition = Partition(geodata, num_districts, prob_dict, epsilon=10)
+    partition = Partition(geodata, num_districts, prob_dict, epsilon=0)
     
     # Run Random Search heuristic (reduced iterations for faster execution)
     depot_id, district_roots, assignment, obj_val, district_info = partition.random_search(
@@ -439,23 +447,9 @@ def main():
     fig = create_visualization(geodata, depot_id, district_roots, assignment, 
                              dispatch_intervals, prob_dict, Omega_dict, district_info)
     
-    # Add main title and notes
-    fig.suptitle('Random Search Solution: Optimal Service Design and Demand Distributions', 
-                fontsize=16, fontweight='bold')
-    
-    # Add note at bottom
-    note_text = ("Note. The figure presents the optimal service design alongside the nominal and worst-case demand distributions " +
-                "for the synthetic case. The left panel shows the optimal depot location (red square), partition of the service region " +
-                "into three districts (colored tints), ODD feature bars for each block, the optimal dispatch intervals, and the " +
-                "underlying continuous spatial demand distribution (blue shading). The right panel contrasts the empirical nominal " +
-                "distribution, represented by sampled demand points (blue dots), with the worst-case distribution intensities " +
-                "(orange shading) from the CQCP inner optimization problem, showing how demand uncertainty affects service planning.")
-    
-    fig.text(0.5, 0.02, note_text, ha='center', va='bottom', fontsize=10, wrap=True)
-    
-    # Save figure
-    plt.savefig('rs_solution_visualization.png', dpi=300, bbox_inches='tight')
-    print("Visualization saved as 'rs_solution_visualization.png'")
+    # Save figure as PDF
+    plt.savefig('rs_solution_visualization.pdf', dpi=300, bbox_inches='tight')
+    print("Visualization saved as 'rs_solution_visualization.pdf'")
     
     plt.show()
 

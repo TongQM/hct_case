@@ -22,6 +22,15 @@ from typing import List, Dict, Tuple, Optional
 from scipy.spatial.distance import pdist, squareform
 from scipy.sparse.csgraph import minimum_spanning_tree
 
+# Try to import python_tsp, fallback to MST if not available
+try:
+    from python_tsp.heuristics import solve_tsp_local_search, solve_tsp_simulated_annealing
+    from python_tsp.exact import solve_tsp_dynamic_programming
+    PYTHON_TSP_AVAILABLE = True
+except ImportError:
+    PYTHON_TSP_AVAILABLE = False
+    print("Warning: python_tsp not available, using MST approximation only")
+
 class ToyGeoData(GeoData):
     """Toy geographic data for simulation testing with fixed service region"""
     
@@ -187,10 +196,16 @@ def create_nominal_distribution(grid_size: int, n_samples: int = 100, seed: int 
     
     return nominal_prob
 
-def approximate_tsp_length(points: List[Tuple[float, float]]) -> float:
+def calculate_tsp_length(points: List[Tuple[float, float]], use_exact: bool = True) -> float:
     """
-    Approximate TSP tour length using MST heuristic (Christofides bound)
-    Returns: approximate tour length through all points
+    Calculate TSP tour length using python_tsp package when available, with MST fallback
+    
+    Args:
+        points: List of (x, y) coordinates
+        use_exact: Whether to use exact/advanced TSP solvers vs MST approximation
+    
+    Returns:
+        TSP tour length through all points
     """
     if len(points) <= 1:
         return 0.0
@@ -204,15 +219,39 @@ def approximate_tsp_length(points: List[Tuple[float, float]]) -> float:
     coords = np.array(points)
     dist_matrix = squareform(pdist(coords, 'euclidean'))
     
-    # Use MST heuristic: TSP ≈ 2 * MST (within factor of 2)
+    if use_exact and PYTHON_TSP_AVAILABLE:
+        try:
+            # Choose TSP method based on problem size
+            if len(points) <= 12:
+                # Exact solution for small instances (≤12 points for reasonable time)
+                _, distance = solve_tsp_dynamic_programming(dist_matrix)
+                return distance
+            elif len(points) <= 30:
+                # Simulated annealing for medium instances
+                _, distance = solve_tsp_simulated_annealing(dist_matrix, max_processing_time=2.0)
+                return distance
+            else:
+                # Local search for larger instances
+                _, distance = solve_tsp_local_search(dist_matrix)
+                return distance
+        except Exception as e:
+            # Fallback to MST if TSP solver fails
+            print(f"Warning: TSP solver failed ({e}), using MST fallback")
+    
+    # MST-based approximation (fallback or when use_exact=False)
     mst = minimum_spanning_tree(dist_matrix)
     mst_length = mst.sum()
     
     # Christofides bound: TSP ≤ 1.5 * MST for metric spaces
-    # We use 2 * MST as a simpler upper bound
-    tsp_approx = 2.0 * mst_length
-    
-    return tsp_approx
+    # We use 2 * MST as a conservative upper bound
+    return 2.0 * mst_length
+
+def approximate_tsp_length(points: List[Tuple[float, float]]) -> float:
+    """
+    Legacy function name for backward compatibility
+    Now uses enhanced TSP calculation with python_tsp when available
+    """
+    return calculate_tsp_length(points, use_exact=True)
 
 def sample_demand_points_in_district(geo_data: ToyGeoData, 
                                    district_blocks: List[str], 
@@ -358,8 +397,14 @@ def optimize_service_design(geo_data: ToyGeoData,
     
     # Extract dispatch intervals from district_info
     dispatch_intervals = {}
-    for cost, root, K_i, F_i, T_star in district_info:
-        dispatch_intervals[root] = T_star
+    for district_data in district_info:
+        if len(district_data) >= 5:
+            cost, root, K_i, F_i, T_star = district_data[:5]  # Take first 5 elements
+            dispatch_intervals[root] = T_star
+        else:
+            # Fallback for old format
+            cost, root, K_i, F_i, T_star = district_data
+            dispatch_intervals[root] = T_star
     
     return ServiceDesign(
         depot_id=depot,
@@ -375,8 +420,17 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
                               true_sampler: callable,
                               Omega_dict: Dict[str, np.ndarray],
                               J_function: callable,
-                              daily_demand_rate: float = 100.0) -> SimulationResults:
-    """Simulate one day's operation of the service design using true distribution"""
+                              daily_demand_rate: float = 100.0,
+                              wr: float = 1.0,  # Time-to-cost conversion factor
+                              wv: float = 10.0) -> SimulationResults:  # Vehicle speed (miles/minute)
+    """Simulate one day's operation of the service design using true distribution
+    
+    Service hours: 8am-8pm (12 hours total)
+    Provider costs: Amortized per hour
+    User costs: Properly weighted by wr (time-to-cost) and wv (vehicle speed)
+    """
+    
+    SERVICE_HOURS = 12.0  # 8am to 8pm = 12 hours
     
     block_ids = geo_data.short_geoid_list
     N = len(block_ids)
@@ -387,7 +441,6 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
     
     # Aggregate demand by block
     daily_demands = {block_id: 0 for block_id in block_ids}
-    total_daily_demand = 0
     
     for x, y in demand_samples:
         # Determine which block this demand falls into
@@ -397,14 +450,9 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
         block_id = block_ids[block_idx]
         
         daily_demands[block_id] += 1
-        total_daily_demand += 1
     
-    # Compute costs for each district
-    provider_cost = 0.0
-    user_cost = 0.0
-    linehaul_cost = 0.0
-    odd_cost = 0.0
-    travel_cost = 0.0
+    # Initialize for minimax objective: track individual district costs
+    district_costs = []  # List of (district_id, provider_cost, user_cost, total_cost, linehaul, odd, travel)
     max_wait_time = 0.0
     max_travel_time = 0.0
     
@@ -426,35 +474,48 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
         # Dispatch interval for this district
         T_star = service_design.dispatch_intervals[root_id]
         
-        # Number of dispatches needed
-        num_dispatches = max(1, int(np.ceil(24.0 / T_star)))  # Dispatches per day
-        demand_per_dispatch = district_demand / num_dispatches
+        # Number of dispatches during service hours (8am-8pm = 12 hours)
+        # T_star is in hours (from CQCP optimization), so use SERVICE_HOURS
+        num_dispatches = max(1, int(np.ceil(SERVICE_HOURS / T_star)))  # Dispatches during service hours
         
-        # Provider costs
-        # 1. Linehaul cost: fixed cost from depot to closest block in district
+        # Calculate district demand rate (demands per hour)
+        district_demand_rate = district_demand / SERVICE_HOURS
+        
+        # === DISTRICT-LEVEL COSTS (for minimax objective) ===
+        
+        # Provider costs for this district
+        # 1. Linehaul cost: depot to closest block in district
         min_depot_dist = min(geo_data.get_dist(service_design.depot_id, block_id) 
                             for block_id in assigned_blocks)
-        dispatch_linehaul = min_depot_dist * num_dispatches
-        linehaul_cost += dispatch_linehaul
+        total_linehaul = min_depot_dist
+        district_linehaul = total_linehaul / T_star
         
-        # 2. ODD cost: based on district ODD features
+        # 2. ODD cost: based on district maximum ODD features
         district_omega = np.zeros(2)
         for block_id in assigned_blocks:
             if block_id in Omega_dict:
-                # Element-wise maximum for district ODD features
                 district_omega = np.maximum(district_omega, Omega_dict[block_id])
         
-        district_odd_cost = J_function(district_omega) * num_dispatches
-        odd_cost += district_odd_cost
+        total_odd_cost = J_function(district_omega) * num_dispatches
+        district_odd = total_odd_cost / T_star
         
-        # 3. Travel cost: realistic TSP-based vehicle routing within district
+        # 3. Travel cost: TSP-based routing with Poisson demand arrivals
         district_travel = 0.0
+        total_dispatch_demand = 0  # Track total for verification
+        
         for dispatch in range(num_dispatches):
-            # Sample actual demand points for this dispatch
-            dispatch_demand = int(np.ceil(demand_per_dispatch))
+            # Poisson demand arrivals: λ = demand_rate × dispatch_interval
+            dispatch_lambda = district_demand_rate * T_star
+            
+            # Generate unique seed for this dispatch (for Poisson + spatial sampling)
+            dispatch_seed = hash((grid_size, root_id, dispatch, daily_demand_rate)) % 1000000
+            np.random.seed(dispatch_seed)
+            
+            # Sample actual demand for this dispatch (Poisson distributed)
+            dispatch_demand = np.random.poisson(dispatch_lambda)
+            total_dispatch_demand += dispatch_demand
+            
             if dispatch_demand > 0:
-                # Get dispatch-specific sampler with unique seed
-                dispatch_seed = hash((grid_size, root_id, dispatch, daily_demand_rate)) % 1000000
                 def dispatch_sampler(n):
                     return true_sampler(n, dispatch_seed)
                 
@@ -463,33 +524,72 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
                 )
                 
                 if demand_points:
-                    # Approximate TSP tour length through demand points
-                    tsp_length = approximate_tsp_length(demand_points)
+                    # Use enhanced TSP calculation
+                    tsp_length = calculate_tsp_length(demand_points, use_exact=True)
                     district_travel += tsp_length
+                    
+                    # Debug: show Poisson variance and TSP method
+                    if dispatch == 0:
+                        method = "Exact" if len(demand_points) <= 12 and PYTHON_TSP_AVAILABLE else "Heuristic" if PYTHON_TSP_AVAILABLE else "MST"
+                        print(f"      District {root_id}: λ={dispatch_lambda:.2f}, actual={dispatch_demand}, points={len(demand_points)}, TSP={tsp_length:.3f} ({method})")
         
-        travel_cost += district_travel
+        # Debug: show total demand vs expected
+        expected_total = district_demand_rate * SERVICE_HOURS
+        print(f"      District {root_id}: expected_demand={expected_total:.1f}, actual_total={total_dispatch_demand}, dispatches={num_dispatches}")
         
-        # User costs
-        # 1. Wait time: maximum dispatch interval (worst case)
+        district_travel_cost = district_travel / T_star
+        
+        # Total provider cost for this district
+        district_provider_cost = district_linehaul + district_odd + district_travel_cost
+        
+        print(f"      District {root_id}: provider={district_provider_cost:.3f} (linehaul={district_linehaul:.3f}, odd={district_odd:.3f}, travel={district_travel_cost:.3f})")
+        
+        # User costs for this district
+        # 1. Wait time: dispatch interval
         district_wait = T_star
+        
+        # 2. Travel time: same routing distance as provider (TSP + linehaul)
+        district_travel_time = (district_travel + total_linehaul) / wv
+        
+        # Total user cost for this district (time converted to cost units)
+        district_user_cost = wr * (district_wait + district_travel_time)
+        
+        # Total cost for this district
+        district_total_cost = district_provider_cost + district_user_cost
+        
+        # Store district cost information with precise components
+        district_costs.append((root_id, district_provider_cost, district_user_cost, district_total_cost, 
+                             district_linehaul, district_odd, district_travel_cost))
+        print(f"      District {root_id}: user={district_user_cost:.3f}, total={district_total_cost:.3f}")
+        print()  # Add spacing between districts
+        
+        # Track global maximums for reporting
         max_wait_time = max(max_wait_time, district_wait)
-        
-        # 2. Travel time: linehaul + in-district travel
-        # Linehaul: half distance from depot to district center
-        linehaul_travel_time = min_depot_dist / 2.0
-        
-        # In-district: maximum distance from root to any block in district
-        max_in_district_dist = max(
-            geo_data.get_dist(root_id, block_id) 
-            for block_id in assigned_blocks
-        )
-        
-        district_travel_time = linehaul_travel_time + max_in_district_dist
         max_travel_time = max(max_travel_time, district_travel_time)
     
-    provider_cost = linehaul_cost + odd_cost + travel_cost
-    user_cost = max_wait_time + max_travel_time
-    total_cost = provider_cost + user_cost
+    # === MINIMAX OBJECTIVE: Maximum district cost ===
+    
+    if not district_costs:
+        # No districts with demand
+        total_cost = 0.0
+        provider_cost = 0.0
+        user_cost = 0.0
+        linehaul_cost = 0.0
+        odd_cost = 0.0
+        travel_cost = 0.0
+    else:
+        # Find the district with maximum total cost (minimax objective)
+        max_district = max(district_costs, key=lambda x: x[3])  # x[3] is total_cost
+        worst_district_id, worst_provider, worst_user, total_cost, worst_linehaul, worst_odd, worst_travel = max_district
+        
+        print(f"   🎯 MINIMAX: Worst district is {worst_district_id} with cost {total_cost:.3f}")
+        
+        # Use the worst district's precise cost components
+        provider_cost = worst_provider
+        user_cost = worst_user
+        linehaul_cost = worst_linehaul
+        odd_cost = worst_odd
+        travel_cost = worst_travel
     
     return SimulationResults(
         provider_cost=provider_cost,
@@ -576,11 +676,13 @@ def run_simulation_study(grid_sizes: List[int],
                 return true_sampler(n_samples, seed_to_use)
             
             dro_result = simulate_one_day_operation(
-                geo_data, dro_design, trial_sampler, Omega_dict, J_function
+                geo_data, dro_design, trial_sampler, Omega_dict, J_function,
+                daily_demand_rate=100.0, wr=1.0, wv=10.0
             )
             
             non_dro_result = simulate_one_day_operation(
-                geo_data, non_dro_design, trial_sampler, Omega_dict, J_function
+                geo_data, non_dro_design, trial_sampler, Omega_dict, J_function,
+                daily_demand_rate=100.0, wr=1.0, wv=10.0
             )
             
             # Record results
@@ -602,7 +704,101 @@ def run_simulation_study(grid_sizes: List[int],
     
     return pd.DataFrame(results)
 
-def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict = None) -> None:
+def create_cost_table(df: pd.DataFrame) -> pd.DataFrame:
+    """Create cost comparison table for DRO vs Non-DRO service designs"""
+    
+    # Group by blocks and design_type, compute mean and std
+    summary_stats = df.groupby(['blocks', 'design_type']).agg({
+        'total_cost': ['mean', 'std'],
+        'provider_cost': ['mean', 'std'], 
+        'user_cost': ['mean', 'std'],
+        'linehaul_cost': ['mean', 'std'],
+        'odd_cost': ['mean', 'std']
+    }).round(1)
+    
+    # Flatten column names
+    summary_stats.columns = ['_'.join(col).strip() for col in summary_stats.columns]
+    summary_stats = summary_stats.reset_index()
+    
+    # Create table data
+    table_data = []
+    
+    for blocks in sorted(df['blocks'].unique()):
+        row_data = {'Blocks': blocks, 'Trials': 5}  # Assuming 5 trials per config
+        
+        block_data = summary_stats[summary_stats['blocks'] == blocks]
+        
+        # Get DRO and Non-DRO data
+        dro_data = block_data[block_data['design_type'] == 'DRO']
+        non_dro_data = block_data[block_data['design_type'] == 'Non-DRO']
+        
+        if not dro_data.empty:
+            dro_mean = dro_data['total_cost_mean'].iloc[0]
+            dro_std = dro_data['total_cost_std'].iloc[0]
+            row_data['DRO Cost'] = f"{dro_mean:.1f} ± {dro_std:.1f}"
+        
+        if not non_dro_data.empty:
+            non_dro_mean = non_dro_data['total_cost_mean'].iloc[0]
+            non_dro_std = non_dro_data['total_cost_std'].iloc[0]
+            row_data['Non DRO Cost'] = f"{non_dro_mean:.1f} ± {non_dro_std:.1f}"
+            
+            # Use Non-DRO data for component costs (as shown in reference table)
+            prov_mean = non_dro_data['provider_cost_mean'].iloc[0]
+            prov_std = non_dro_data['provider_cost_std'].iloc[0]
+            row_data['PROV'] = f"{prov_mean:.1f} ± {prov_std:.1f}"
+            
+            user_mean = non_dro_data['user_cost_mean'].iloc[0]
+            user_std = non_dro_data['user_cost_std'].iloc[0]
+            row_data['USER'] = f"{user_mean:.1f} ± {user_std:.1f}"
+            
+            linehaul_mean = non_dro_data['linehaul_cost_mean'].iloc[0]
+            linehaul_std = non_dro_data['linehaul_cost_std'].iloc[0]
+            row_data['Linehaul'] = f"{linehaul_mean:.1f} ± {linehaul_std:.1f}"
+            
+            odd_mean = non_dro_data['odd_cost_mean'].iloc[0]
+            odd_std = non_dro_data['odd_cost_std'].iloc[0]
+            row_data['ODD'] = f"{odd_mean:.1f} ± {odd_std:.1f}"
+        
+        table_data.append(row_data)
+    
+    return pd.DataFrame(table_data)
+
+def print_cost_table(df: pd.DataFrame, algorithm_name: str = "Algorithm") -> None:
+    """Print cost comparison table in publication format"""
+    
+    table_df = create_cost_table(df)
+    
+    print("\\n" + "=" * 100)
+    print(f"Table 1    Costs of the Service Design Obtained by {algorithm_name}")
+    print("=" * 100)
+    
+    # Print header
+    header = f"{'Blocks':<8} {'Trials':<8} {'DRO Cost':<12} {'Non DRO Cost':<14} {'PROV':<12} {'USER':<12} {'Linehaul':<12} {'ODD':<12}"
+    print(header)
+    print("-" * 100)
+    
+    # Print data rows
+    for _, row in table_df.iterrows():
+        blocks = row.get('Blocks', '')
+        trials = row.get('Trials', '')
+        dro_cost = row.get('DRO Cost', '')
+        non_dro_cost = row.get('Non DRO Cost', '')
+        prov = row.get('PROV', '')
+        user = row.get('USER', '')
+        linehaul = row.get('Linehaul', '')
+        odd = row.get('ODD', '')
+        
+        row_str = f"{blocks:<8} {trials:<8} {dro_cost:<12} {non_dro_cost:<14} {prov:<12} {user:<12} {linehaul:<12} {odd:<12}"
+        print(row_str)
+    
+    print("=" * 100)
+    
+    # Save to CSV
+    filename = f'{algorithm_name.lower()}_cost_table.csv'
+    table_df.to_csv(filename, index=False)
+    print(f"\\nTable saved as '{filename}'")
+
+def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict = None, algorithm_name: str = "Algorithm") -> None:
     """Analyze simulation results and create summary table and visualizations"""
     
     print("\\n" + "=" * 80)
@@ -649,8 +845,8 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     
     # Create comprehensive visualizations
     fig, axes = plt.subplots(3, 2, figsize=(16, 18))
-    fig.suptitle('Service Design Simulation Results with TSP Travel Costs\\nFixed 10×10 Mile Service Region', 
-                fontsize=16, fontweight='bold')
+    # fig.suptitle('Service Design Simulation Results with TSP Travel Costs\\nFixed 10×10 Mile Service Region', 
+    #             fontsize=16, fontweight='bold')
     
     # 1. Total Cost Comparison
     ax1 = axes[0, 0]
@@ -667,7 +863,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax1.bar(x + width/2, non_dro_means, width, yerr=non_dro_stds, label='Non-DRO', alpha=0.8, capsize=5)
     ax1.set_xlabel('Number of Blocks')
     ax1.set_ylabel('Total Cost')
-    ax1.set_title('Total Cost Comparison')
+    # ax1.set_title('Total Cost Comparison')
     ax1.set_xticks(x)
     ax1.set_xticklabels(blocks_list)
     ax1.legend()
@@ -682,7 +878,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax2.bar(x, dro_user, width, bottom=dro_prov, label='User Cost (DRO)', alpha=0.8)
     ax2.set_xlabel('Number of Blocks')
     ax2.set_ylabel('Cost')
-    ax2.set_title('Cost Breakdown (DRO Design)')
+    # ax2.set_title('Cost Breakdown (DRO Design)')
     ax2.set_xticks(x)
     ax2.set_xticklabels(blocks_list)
     ax2.legend()
@@ -699,7 +895,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax3.plot(blocks_list, travel_means, '^-', label='TSP Travel Cost', linewidth=2, markersize=8)
     ax3.set_xlabel('Number of Blocks')
     ax3.set_ylabel('Cost (Miles)')
-    ax3.set_title('Cost Component Scaling (DRO)')
+    # ax3.set_title('Cost Component Scaling (DRO)')
     ax3.legend()
     ax3.grid(True, alpha=0.3)
     
@@ -711,7 +907,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax4.bar(x, percent_improvement, alpha=0.8, color='green')
     ax4.set_xlabel('Number of Blocks')
     ax4.set_ylabel('Cost Reduction (%)')
-    ax4.set_title('DRO Benefit vs Non-DRO')
+    # ax4.set_title('DRO Benefit vs Non-DRO')
     ax4.set_xticks(x)
     ax4.set_xticklabels(blocks_list)
     ax4.grid(True, alpha=0.3)
@@ -730,7 +926,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax5.scatter(grid_sizes, travel_per_dispatch, s=100, alpha=0.7, label='Travel/Dispatch', marker='^')
     ax5.set_xlabel('Grid Resolution')
     ax5.set_ylabel('Normalized Cost')
-    ax5.set_title('Travel vs Linehaul Scaling')
+    # ax5.set_title('Travel vs Linehaul Scaling')
     ax5.legend()
     ax5.grid(True, alpha=0.3)
     
@@ -742,7 +938,7 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
     ax6.plot(block_density, total_cost_per_block, 'o-', linewidth=2, markersize=8, color='purple')
     ax6.set_xlabel('Block Density (blocks/sq mile)')
     ax6.set_ylabel('Cost per Block')
-    ax6.set_title('Cost Efficiency vs Resolution')
+    # ax6.set_title('Cost Efficiency vs Resolution')
     ax6.grid(True, alpha=0.3)
     
     # Add trend annotation
@@ -752,8 +948,8 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
                 bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.5))
     
     plt.tight_layout()
-    plt.savefig('service_design_simulation_results.png', dpi=300, bbox_inches='tight')
-    print(f"\\n📁 Saved comprehensive visualization as 'service_design_simulation_results.png'")
+    plt.savefig('service_design_simulation_results.pdf', dpi=300, bbox_inches='tight')
+    print(f"\\n📁 Saved comprehensive visualization as 'service_design_simulation_results.pdf'")
     
     # Save detailed results to CSV
     df.to_csv('simulation_results_detailed.csv', index=False)
@@ -764,8 +960,8 @@ def analyze_and_visualize_results(df: pd.DataFrame, service_designs_info: Dict =
 def main():
     """Main function for running simulation study"""
     parser = argparse.ArgumentParser(description='Service Design Simulation Study')
-    parser.add_argument('--grid_sizes', nargs='+', type=int, default=[3, 4, 5, 6, 7, 8], 
-                       help='Grid sizes to test (default: 3 4 5 6 7 8)')
+    parser.add_argument('--grid_sizes', nargs='+', type=int, default=[3, 4, 5, 6, 7, 8, 9, 10], 
+                       help='Grid sizes to test (default: 3 4 5 6 7 8 9 10 for 9,16,25,36,49,64,81,100 blocks)')
     parser.add_argument('--trials', type=int, default=5, help='Number of trials per configuration (default: 5)')
     parser.add_argument('--districts', type=int, default=3, help='Number of districts (default: 3)')
     parser.add_argument('--wasserstein_radius', type=float, default=0.1, help='Wasserstein radius for DRO (default: 0.1)')
@@ -782,8 +978,16 @@ def main():
         n_samples=args.n_samples
     )
     
+    # Print cost comparison table (main result)
+    algorithm_name = "Random Search"  # Can be changed to "LBBD" or other algorithms
+    print_cost_table(results_df, algorithm_name)
+    
     # Analyze and visualize results
-    analyze_and_visualize_results(results_df)
+    analyze_and_visualize_results(results_df, algorithm_name=algorithm_name)
+    
+    # Save detailed results
+    results_df.to_csv('simulation_results_detailed.csv', index=False)
+    print("\\n📁 Detailed results saved as 'simulation_results_detailed.csv'")
     
     print(f"\\n🎉 Simulation study completed successfully!")
     print(f"   📊 Tested {len(args.grid_sizes)} grid sizes with {args.trials} trials each")
