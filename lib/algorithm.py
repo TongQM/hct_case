@@ -445,21 +445,58 @@ class Partition:
         wr = getattr(self.geodata, 'wr', 1.0)
         wv = getattr(self.geodata, 'wv', 10.0)
         
-        # 1-D minimization in C (dispatch subinterval)
-        Cmin = 1e-3
-        Cmax = 12.0
-        best_C = Cmin
-        best_obj = float('inf')
-        for C in np.linspace(Cmin, Cmax, grid_points):
-            ci = np.sqrt(C)
-            # Updated objective using partition-dependent costs
-            g_bar = ((K_i + F_i) * ci**-2 + wr/(2*wv) * K_i + wr * ci**2) + (ci**-1 + wr/wv * ci) * alpha_i
-            if g_bar < best_obj:
-                best_obj = g_bar
-                best_C = C
+        # Newton's method for optimal ci (dispatch subinterval)
+        # g_bar is strictly convex, so we can find the exact optimum analytically
         
-        C_star = best_C
-        ci_star = np.sqrt(C_star)
+        def g_bar_objective(ci):
+            """Objective function g_bar(ci)"""
+            return ((K_i + F_i) * ci**-2 + wr/(2*wv) * K_i + wr * ci**2) + (ci**-1 + wr/wv * ci) * alpha_i
+        
+        def g_bar_derivative(ci):
+            """First derivative dg_bar/dci"""
+            return (-2*(K_i + F_i) * ci**-3 + 2*wr*ci - alpha_i * ci**-2 + (wr/wv) * alpha_i)
+        
+        def g_bar_second_derivative(ci):
+            """Second derivative d²g_bar/dci²"""
+            return (6*(K_i + F_i) * ci**-4 + 2*wr + 2*alpha_i * ci**-3)
+        
+        # Newton's method starting from a reasonable initial guess
+        ci_star = np.sqrt(max(1.0, min(10.0, wv/wr)))  # Start near the high-Lambda limit
+        
+        # Newton iterations
+        for newton_iter in range(20):  # Usually converges in 3-5 iterations
+            grad = g_bar_derivative(ci_star)
+            hess = g_bar_second_derivative(ci_star)
+            
+            if abs(grad) < 1e-8:  # Convergence tolerance
+                break
+                
+            ci_new = ci_star - grad / hess
+            
+            # Ensure ci stays in reasonable bounds
+            ci_new = max(0.01, min(ci_new, 20.0))  
+            
+            if abs(ci_new - ci_star) < 1e-10:
+                break
+                
+            ci_star = ci_new
+        
+        C_star = ci_star**2
+        best_obj = g_bar_objective(ci_star)
+        
+        # Debug output for selected districts
+        debug_optimization = (len(assigned_blocks) > 0 and Lambda is not None and 
+                            hasattr(self, '_debug_count') and self._debug_count < 1)
+        if debug_optimization and not hasattr(self, '_debug_count'):
+            self._debug_count = 0
+            
+        if debug_optimization:
+            print(f"    🔍 Newton method district {root}: Lambda={Lambda}, alpha_i={alpha_i:.4f}")
+            print(f"       Optimal: ci_star={ci_star:.4f}, C_star={C_star:.4f}, g_bar={best_obj:.4f}")
+            print(f"       K_i={K_i:.3f}, F_i={F_i:.3f}, wv/wr_limit={wv/wr:.1f}")
+            print(f"       Newton iterations: {newton_iter + 1}, final_grad={abs(grad):.2e}")
+            
+            self._debug_count += 1
         
         # Subgradients w.r.t. master problem variables
         # ∂g/∂α_i
@@ -480,7 +517,7 @@ class Partition:
             # Subgradient w.r.t. z_ji includes contribution through α_i
             subgrad[bi] = g_alpha * dalpha_dzji
             if bi == root:
-                subgrad[bi] += (K_i + F_i) * ci**-2 + wr/(2*wv) * K_i + wr * ci**2
+                subgrad[bi] += (K_i + F_i) * ci_star**-2 + wr/(2*wv) * K_i + wr * ci_star**2
         
         # Subgradients w.r.t. K_i and F_i for master problem optimization
         subgrad_K_i = g_K  # ∂g/∂K_i = ci_star**-2 + wr/(2*wv)
@@ -496,7 +533,7 @@ class Partition:
         """
         Wrapper function for parallel subproblem solving
         """
-        assigned_block_ids, root_id, prob_dict, epsilon, K_i, F_i, J_function, omega_sol = args
+        assigned_block_ids, root_id, prob_dict, epsilon, K_i, F_i, J_function, omega_sol, beta, Lambda = args
         
         # Calculate actual F_i using the J_function and the district's ODD vector
         actual_F_i = J_function(omega_sol)
@@ -504,11 +541,13 @@ class Partition:
         # Call subproblem solver with thread-safe flag
         return self._CQCP_benders(
             assigned_block_ids, root_id, prob_dict, epsilon, 
-            K_i=K_i, F_i=actual_F_i, single_threaded=True
+            K_i=K_i, F_i=actual_F_i, single_threaded=True,
+            beta=beta, Lambda=Lambda
         )
 
     def benders_decomposition(self, max_iterations=50, tolerance=1e-3, verbose=True, 
-                            Omega_dict=None, J_function=None, parallel=True):
+                            Omega_dict=None, J_function=None, parallel=True,
+                            Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120):
         """
         Updated LBBD with depot location decisions and partition-dependent costs.
         Uses multi-cut generation for all active districts (no limit on number of cuts).
@@ -810,7 +849,7 @@ class Partition:
                     assigned_block_ids = [block_ids[j] for j in assigned_blocks]
                     district_omega = omega_sol[root]
                     args = (assigned_block_ids, block_ids[root], self.prob_dict, self.epsilon, 
-                            K_sol[root], F_sol[root], J_function, district_omega)
+                            K_sol[root], F_sol[root], J_function, district_omega, beta, Lambda)
                     subproblem_args.append((args, root, assigned_blocks))
             
                 # Solve subproblems in parallel with timing
@@ -848,7 +887,8 @@ class Partition:
                 
                     cost, x_star, subgrad, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
                         [block_ids[j] for j in assigned_blocks], block_ids[root], 
-                        self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i)
+                        self.prob_dict, self.epsilon, K_i=K_sol[root], F_i=actual_F_i,
+                        beta=beta, Lambda=Lambda)
                     district_costs.append((cost, root, assigned_blocks, subgrad, x_star, T_star, alpha_i, subgrad_K_i, subgrad_F_i))
                     subgrads.append(subgrad)
                 
@@ -1168,7 +1208,8 @@ class Partition:
             
             # CQCP inner maximization with updated costs
             cost, x_star, _, T_star, alpha_i, subgrad_K_i, subgrad_F_i = self._CQCP_benders(
-                assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i
+                assigned_blocks, root, prob_dict, epsilon, K_i=K_i, F_i=F_i,
+                beta=beta, Lambda=Lambda
             )
             
             district_info.append((cost, root, K_i, F_i, T_star, x_star))

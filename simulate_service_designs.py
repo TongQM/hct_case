@@ -31,6 +31,29 @@ except ImportError:
     PYTHON_TSP_AVAILABLE = False
     print("Warning: python_tsp not available, using MST approximation only")
 
+# ===== CENTRALIZED MIXED-GAUSSIAN PARAMETERS =====
+class MixedGaussianConfig:
+    """Centralized configuration for truncated mixed-Gaussian distribution"""
+    
+    @staticmethod
+    def get_cluster_centers(grid_size: int):
+        """Get cluster centers scaled to grid size"""
+        return [
+            (grid_size * 0.25, grid_size * 0.25),  # Top-left cluster
+            (grid_size * 0.75, grid_size * 0.25),  # Top-right cluster  
+            (grid_size * 0.50, grid_size * 0.75)   # Bottom-center cluster
+        ]
+    
+    @staticmethod
+    def get_cluster_weights():
+        """Get cluster mixing weights"""
+        return [0.4, 0.35, 0.25]
+    
+    @staticmethod
+    def get_cluster_sigmas(grid_size: int):
+        """Get cluster standard deviations scaled to grid size"""
+        return [grid_size * 0.15, grid_size * 0.16, grid_size * 0.12]
+
 class ToyGeoData(GeoData):
     """Toy geographic data for simulation testing with fixed service region"""
     
@@ -129,27 +152,47 @@ class SimulationResults:
     total_cost: float
 
 def create_true_distribution_sampler(grid_size: int, seed: int = 42):
-    """Create sampler for true truncated mixed-Gaussian distribution"""
+    """Create sampler for properly truncated mixed-Gaussian distribution"""
+    from scipy.stats import multivariate_normal
+    
     np.random.seed(seed)
     
-    # Define three cluster centers (scaled to grid size) 
-    cluster_centers = [
-        (grid_size * 0.25, grid_size * 0.25),  # Top-left cluster
-        (grid_size * 0.75, grid_size * 0.25),  # Top-right cluster  
-        (grid_size * 0.50, grid_size * 0.75)   # Bottom-center cluster
-    ]
-    cluster_weights = [0.4, 0.35, 0.25]
-    cluster_sigmas = [grid_size * 0.18, grid_size * 0.20, grid_size * 0.15]
+    # Use centralized configuration
+    cluster_centers = MixedGaussianConfig.get_cluster_centers(grid_size)
+    cluster_weights = MixedGaussianConfig.get_cluster_weights()
+    cluster_sigmas = MixedGaussianConfig.get_cluster_sigmas(grid_size)
+    
+    # Calculate truncation probabilities for each cluster
+    truncated_weights = []
+    
+    for i, (center, sigma) in enumerate(zip(cluster_centers, cluster_sigmas)):
+        # Create 2D Gaussian distribution for this cluster
+        cov_matrix = [[sigma**2, 0], [0, sigma**2]]  # Independent x,y
+        mvn = multivariate_normal(mean=center, cov=cov_matrix)
+        
+        # Calculate probability mass within service region
+        # Use numerical integration over the rectangle [0, grid_size-1] x [0, grid_size-1]
+        prob_inside = mvn.cdf([grid_size-1, grid_size-1]) - mvn.cdf([grid_size-1, 0]) - mvn.cdf([0, grid_size-1]) + mvn.cdf([0, 0])
+        
+        # Renormalized weight = original_weight * prob_inside / sum(all prob_inside)
+        truncated_weights.append(cluster_weights[i] * prob_inside)
+    
+    # Normalize truncated weights
+    total_truncated_weight = sum(truncated_weights)
+    truncated_weights = [w / total_truncated_weight for w in truncated_weights]
     
     def sample_from_true_distribution(n_samples: int, random_seed: Optional[int] = None):
-        """Sample demand points from true truncated mixed-Gaussian distribution"""
+        """Sample from properly truncated mixed-Gaussian distribution"""
         if random_seed is not None:
             np.random.seed(random_seed)
             
         samples = []
-        for _ in range(n_samples):
-            # Choose cluster according to weights
-            cluster_idx = np.random.choice(len(cluster_centers), p=cluster_weights)
+        max_attempts = n_samples * 5  # Prevent infinite loops
+        attempts = 0
+        
+        while len(samples) < n_samples and attempts < max_attempts:
+            # Choose cluster according to truncated weights
+            cluster_idx = np.random.choice(len(cluster_centers), p=truncated_weights)
             center = cluster_centers[cluster_idx]
             sigma = cluster_sigmas[cluster_idx]
             
@@ -157,11 +200,14 @@ def create_true_distribution_sampler(grid_size: int, seed: int = 42):
             x = np.random.normal(center[0], sigma)
             y = np.random.normal(center[1], sigma)
             
-            # Truncate to grid boundaries
-            x = np.clip(x, 0, grid_size - 1)
-            y = np.clip(y, 0, grid_size - 1)
+            # Accept only if within service region (proper truncation)
+            if 0 <= x <= grid_size - 1 and 0 <= y <= grid_size - 1:
+                samples.append((x, y))
             
-            samples.append((x, y))
+            attempts += 1
+        
+        if len(samples) < n_samples:
+            print(f"Warning: Only generated {len(samples)} out of {n_samples} samples")
         
         return samples
     

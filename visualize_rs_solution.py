@@ -16,6 +16,29 @@ from lib.data import GeoData
 import networkx as nx
 from scipy.stats import multivariate_normal, beta, gamma
 
+# ===== CENTRALIZED MIXED-GAUSSIAN PARAMETERS =====
+class MixedGaussianConfig:
+    """Centralized configuration for truncated mixed-Gaussian distribution"""
+    
+    @staticmethod
+    def get_cluster_centers(grid_size: int):
+        """Get cluster centers scaled to grid size"""
+        return [
+            (grid_size * 0.25, grid_size * 0.25),  # Top-left cluster
+            (grid_size * 0.75, grid_size * 0.25),  # Top-right cluster  
+            (grid_size * 0.50, grid_size * 0.75)   # Bottom-center cluster
+        ]
+    
+    @staticmethod
+    def get_cluster_weights():
+        """Get cluster mixing weights"""
+        return [0.4, 0.35, 0.25]
+    
+    @staticmethod
+    def get_cluster_sigmas(grid_size: int):
+        """Get cluster standard deviations scaled to grid size"""
+        return [grid_size * 0.15, grid_size * 0.16, grid_size * 0.12]
+
 class ToyGeoData(GeoData):
     """Toy geographic data for visualization"""
     
@@ -79,27 +102,51 @@ class ToyGeoData(GeoData):
         return 2.0
 
 def create_true_distribution_sampler(grid_size: int, seed: int = 42):
-    """Create sampler for true truncated mixed-Gaussian distribution"""
+    """Create sampler for properly truncated mixed-Gaussian distribution"""
+    from scipy.stats import multivariate_normal
+    
     np.random.seed(seed)
     
-    # Define three cluster centers (scaled to grid size) 
-    cluster_centers = [
-        (grid_size * 0.25, grid_size * 0.25),  # Top-left cluster
-        (grid_size * 0.75, grid_size * 0.25),  # Top-right cluster  
-        (grid_size * 0.50, grid_size * 0.75)   # Bottom-center cluster
-    ]
-    cluster_weights = [0.4, 0.35, 0.25]
-    cluster_sigmas = [grid_size * 0.18, grid_size * 0.20, grid_size * 0.15]
+    # Use centralized configuration
+    cluster_centers = MixedGaussianConfig.get_cluster_centers(grid_size)
+    cluster_weights = MixedGaussianConfig.get_cluster_weights()
+    cluster_sigmas = MixedGaussianConfig.get_cluster_sigmas(grid_size)
+    
+    # Calculate truncation probabilities for each cluster
+    service_bounds = [0, grid_size - 1]
+    truncated_weights = []
+    
+    for i, (center, sigma) in enumerate(zip(cluster_centers, cluster_sigmas)):
+        # Create 2D Gaussian distribution for this cluster
+        cov_matrix = [[sigma**2, 0], [0, sigma**2]]  # Independent x,y
+        mvn = multivariate_normal(mean=center, cov=cov_matrix)
+        
+        # Calculate probability mass within service region
+        # Use numerical integration over the rectangle [0, grid_size-1] x [0, grid_size-1]
+        prob_inside = mvn.cdf([grid_size-1, grid_size-1]) - mvn.cdf([grid_size-1, 0]) - mvn.cdf([0, grid_size-1]) + mvn.cdf([0, 0])
+        
+        # Renormalized weight = original_weight * prob_inside / sum(all prob_inside)
+        truncated_weights.append(cluster_weights[i] * prob_inside)
+    
+    # Normalize truncated weights
+    total_truncated_weight = sum(truncated_weights)
+    truncated_weights = [w / total_truncated_weight for w in truncated_weights]
+    
+    print(f"Original weights: {cluster_weights}")
+    print(f"Truncated weights: {[f'{w:.3f}' for w in truncated_weights]}")
     
     def sample_from_true_distribution(n_samples: int, random_seed=None):
-        """Sample demand points from true truncated mixed-Gaussian distribution"""
+        """Sample from properly truncated mixed-Gaussian distribution"""
         if random_seed is not None:
             np.random.seed(random_seed)
             
         samples = []
-        for _ in range(n_samples):
-            # Choose cluster according to weights
-            cluster_idx = np.random.choice(len(cluster_centers), p=cluster_weights)
+        max_attempts = n_samples * 5  # Prevent infinite loops
+        attempts = 0
+        
+        while len(samples) < n_samples and attempts < max_attempts:
+            # Choose cluster according to truncated weights
+            cluster_idx = np.random.choice(len(cluster_centers), p=truncated_weights)
             center = cluster_centers[cluster_idx]
             sigma = cluster_sigmas[cluster_idx]
             
@@ -107,11 +154,14 @@ def create_true_distribution_sampler(grid_size: int, seed: int = 42):
             x = np.random.normal(center[0], sigma)
             y = np.random.normal(center[1], sigma)
             
-            # Truncate to grid boundaries
-            x = np.clip(x, 0, grid_size - 1)
-            y = np.clip(y, 0, grid_size - 1)
+            # Accept only if within service region (proper truncation)
+            if 0 <= x <= grid_size - 1 and 0 <= y <= grid_size - 1:
+                samples.append((x, y))
             
-            samples.append((x, y))
+            attempts += 1
+        
+        if len(samples) < n_samples:
+            print(f"Warning: Only generated {len(samples)} out of {n_samples} samples")
         
         return samples
     
@@ -175,32 +225,56 @@ def J_function(omega):
     return 50 * (omega[0]**1.5 + omega[1]**1.2)
 
 def create_continuous_demand_field(grid_size, service_region_miles=10.0, resolution=100):
-    """Create continuous demand distribution for visualization"""
-    # Three cluster centers in miles
-    cluster_centers = [
-        (service_region_miles * 0.25, service_region_miles * 0.25),  # Top-left
-        (service_region_miles * 0.75, service_region_miles * 0.25),  # Top-right  
-        (service_region_miles * 0.50, service_region_miles * 0.75)   # Bottom-center
-    ]
+    """Create continuous TRUE truncated mixed-Gaussian demand distribution for visualization"""
+    from scipy.stats import multivariate_normal
     
-    weights = [0.4, 0.35, 0.25]
+    # Use same parameters as the true distribution sampler
+    miles_per_grid_unit = service_region_miles / grid_size
+    
+    # Use centralized configuration
+    cluster_centers_grid = MixedGaussianConfig.get_cluster_centers(grid_size)
+    cluster_weights = MixedGaussianConfig.get_cluster_weights()
+    cluster_sigmas = MixedGaussianConfig.get_cluster_sigmas(grid_size)
+    
+    # Convert grid coordinates to miles
+    cluster_centers = [(cx * miles_per_grid_unit, cy * miles_per_grid_unit) 
+                      for cx, cy in cluster_centers_grid]
+    cluster_sigmas_miles = [sigma * miles_per_grid_unit for sigma in cluster_sigmas]
+    
+    # Calculate truncation probabilities for proper normalization
+    truncated_weights = []
+    for i, (center_grid, sigma_grid) in enumerate(zip(cluster_centers_grid, cluster_sigmas)):
+        # Create 2D Gaussian distribution for this cluster
+        cov_matrix = [[sigma_grid**2, 0], [0, sigma_grid**2]]
+        mvn = multivariate_normal(mean=center_grid, cov=cov_matrix)
+        
+        # Calculate probability mass within service region
+        prob_inside = mvn.cdf([grid_size-1, grid_size-1]) - mvn.cdf([grid_size-1, 0]) - mvn.cdf([0, grid_size-1]) + mvn.cdf([0, 0])
+        truncated_weights.append(cluster_weights[i] * prob_inside)
+    
+    # Normalize truncated weights
+    total_weight = sum(truncated_weights)
+    truncated_weights = [w / total_weight for w in truncated_weights]
     
     # Create high-resolution grid
     x = np.linspace(0, service_region_miles, resolution)
     y = np.linspace(0, service_region_miles, resolution)
     X, Y = np.meshgrid(x, y)
     
-    # Compute continuous demand field
+    # Compute truncated continuous demand field
     demand_field = np.zeros((resolution, resolution))
-    for k, (cx, cy) in enumerate(cluster_centers):
-        cov = [[1.5, 0.2], [0.2, 1.5]]
-        rv = multivariate_normal([cx, cy], cov)
+    for k, (center_miles, sigma_miles) in enumerate(zip(cluster_centers, cluster_sigmas_miles)):
+        cov_miles = [[sigma_miles**2, 0], [0, sigma_miles**2]]
+        rv = multivariate_normal(center_miles, cov_miles)
+        
         for i in range(resolution):
             for j in range(resolution):
-                density = rv.pdf([X[i, j], Y[i, j]])
-                demand_field[i, j] += weights[k] * density
+                # Only add density if within service region
+                if 0 <= X[i, j] <= service_region_miles and 0 <= Y[i, j] <= service_region_miles:
+                    density = rv.pdf([X[i, j], Y[i, j]])
+                    demand_field[i, j] += truncated_weights[k] * density
     
-    return demand_field * 1000  # Scale for visibility
+    return demand_field * 2000  # Scale for visibility
 
 def create_visualization(geodata, depot_id, district_roots, assignment, dispatch_intervals, 
                         prob_dict, Omega_dict, district_info=None):
@@ -313,33 +387,25 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     
     # === RIGHT PANEL: Demand Distributions ===
     
-    # Empirical demand points (blue dots) - sample in miles coordinates
+    # True demand points (blue dots) - sample from underlying mixed-Gaussian distribution
     np.random.seed(42)
-    n_samples = 50
-    empirical_points = []
+    n_samples = 100  # Increased for better visualization
     
-    for _ in range(n_samples):
-        # Sample from the demand distribution
-        total_prob = sum(prob_dict.values())
-        rand_val = np.random.random() * total_prob
-        cumsum = 0
-        
-        for i in range(grid_size):
-            for j in range(grid_size):
-                block_id = f"BLK{i * grid_size + j:03d}"
-                cumsum += prob_dict[block_id]
-                if cumsum >= rand_val:
-                    # Add some noise within the block (in miles)
-                    x = j * miles_per_block + np.random.random() * miles_per_block
-                    y = i * miles_per_block + np.random.random() * miles_per_block
-                    empirical_points.append((x, y))
-                    break
-            else:
-                continue
-            break
+    # Create true distribution sampler
+    true_sampler = create_true_distribution_sampler(grid_size, seed=42)
+    
+    # Sample from true mixed-Gaussian distribution
+    empirical_points_grid = true_sampler(n_samples)
+    
+    # Convert grid coordinates to miles coordinates
+    empirical_points = []
+    for x_grid, y_grid in empirical_points_grid:
+        x_miles = x_grid * miles_per_block
+        y_miles = y_grid * miles_per_block
+        empirical_points.append((x_miles, y_miles))
     
     empirical_x, empirical_y = zip(*empirical_points)
-    ax2.scatter(empirical_x, empirical_y, c='blue', s=20, alpha=0.6, label='Empirical demand points')
+    ax2.scatter(empirical_x, empirical_y, c='blue', s=20, alpha=0.6, label='True demand samples')
     
     # Extract worst-case distribution from CQCP solutions if available
     worst_case_dist = np.zeros((grid_size, grid_size))
@@ -384,11 +450,22 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     
+    # Add title for right panel
+    # ax2.set_title('True Demand Samples vs Worst-Case Distribution')
+    
     # Add colorbar for worst-case distribution
     cbar2 = plt.colorbar(im2, ax=ax2, shrink=0.8)
     cbar2.set_label('Worst-case intensity (CQCP solution)')
     
+    # Add title for left panel  
+    # ax1.set_title('Optimal Service Design')
+    
     plt.tight_layout()
+    
+    # Add overall figure title
+    # fig.suptitle(f'Random Search Optimization Results ({grid_size}×{grid_size} Grid)\nTrue Mixed-Gaussian Demand vs Distributionally Robust Design', 
+    #             fontsize=14, fontweight='bold', y=0.98)
+    
     return fig
 
 def main():
@@ -400,8 +477,32 @@ def main():
     print("Setting up toy geographic data...")
     geodata = ToyGeoData(n_blocks, grid_size, service_region_miles=10.0, seed=42)
     
-    print("Generating demand and ODD distributions...")
-    prob_dict = create_nominal_distribution(grid_size, n_samples=1000, seed=42)
+    print("Generating true demand samples and constructing nominal distribution...")
+    
+    # Step 1: Sample from true mixed-Gaussian distribution
+    true_sampler = create_true_distribution_sampler(grid_size, seed=42)
+    true_demand_samples = true_sampler(1000)  # Sample 1000 points
+    
+    # Step 2: Construct nominal distribution from true samples
+    prob_dict = {}
+    short_geoid_list = [f"BLK{i:03d}" for i in range(n_blocks)]
+    
+    # Initialize all blocks with zero probability
+    for block_id in short_geoid_list:
+        prob_dict[block_id] = 0.0
+    
+    # Count samples in each block
+    for x, y in true_demand_samples:
+        # Determine which block this sample falls into
+        block_row = int(np.clip(np.floor(x), 0, grid_size - 1))
+        block_col = int(np.clip(np.floor(y), 0, grid_size - 1))
+        block_idx = block_row * grid_size + block_col
+        block_id = short_geoid_list[block_idx]
+        prob_dict[block_id] += 1.0 / len(true_demand_samples)
+    
+    print(f"Constructed nominal distribution from {len(true_demand_samples)} true samples")
+    
+    # Generate ODD features
     Omega_dict = generate_odd_features(grid_size, seed=42)
     
     # Verify probabilities sum to 1
@@ -413,13 +514,13 @@ def main():
     print(f"Sample probabilities: {sample_probs}")
     
     print("Creating partition instance and running Random Search...")
-    partition = Partition(geodata, num_districts, prob_dict, epsilon=0)
+    partition = Partition(geodata, num_districts, prob_dict, epsilon=1)
     
     # Run Random Search heuristic (reduced iterations for faster execution)
     depot_id, district_roots, assignment, obj_val, district_info = partition.random_search(
         max_iters=20,
         prob_dict=prob_dict,
-        Lambda=25.0, wr=1.0, wv=10.0, beta=0.7120,
+        Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
         Omega_dict=Omega_dict,
         J_function=J_function
     )
