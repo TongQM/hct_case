@@ -58,7 +58,7 @@ def verify_proposition4_analytical():
     print()
     
     # Define test cases with varying alpha_i (via different Lambda values)
-    lambda_values = np.logspace(0, 5, 100)  # From 1 to 100000 for better convergence
+    lambda_values = np.logspace(0, 8, 200)  # From 1 to 100000 for better convergence
     
     # Simulate alpha_i = beta * sqrt(Lambda) * raw_alpha 
     # Assume raw_alpha ≈ 1.0 for simplicity (can be adjusted)
@@ -74,8 +74,8 @@ def verify_proposition4_analytical():
     
     # Create single compressed plot
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
-    fig.suptitle('Proposition 4 Verification: Monotonicity of c_i* vs α(P_i)', 
-                fontsize=16, fontweight='bold')
+    # fig.suptitle('Proposition 4 Verification: Monotonicity of c_i* vs α(P_i)', 
+    #             fontsize=16, fontweight='bold')
     
     results = []
     
@@ -124,15 +124,16 @@ def verify_proposition4_analytical():
         results.append((case, alpha_values, ci_star_values))
     
     # Format main plot
-    ax.set_xlabel('α(Pi)', fontsize=14)
-    ax.set_ylabel('ci*', fontsize=14)
-    ax.set_title('Monotonicity of Optimal Dispatch Interval vs Demand Intensity', fontsize=14, pad=20)
+    ax.set_xlabel('α(Pi)', fontsize=16)
+    ax.set_ylabel('ci*', fontsize=16)
+    ax.tick_params(axis='both', which='major', labelsize=14)
+    # ax.set_title('Monotonicity of Optimal Dispatch Interval vs Demand Intensity', fontsize=14, pad=20)
     ax.grid(True, alpha=0.3)
     
     # Add theoretical limit to main plot
     limit_ci = np.sqrt(wv/wr)
     ax.axhline(y=limit_ci, color='black', linestyle='--', alpha=0.8, linewidth=2,
-               label=f'Asymptotic limit: √(wv²/wr) = {limit_ci:.2f}')
+               label=f'Asymptotic limit: √(wv/wr) = {limit_ci:.2f}')
     
     # Set log scale for x-axis to better show convergence
     ax.set_xscale('log')
@@ -145,16 +146,17 @@ def verify_proposition4_analytical():
         else:
             legend_labels.append(case['name'])
     
-    ax.legend(fontsize=12, loc='center right')
+    ax.legend(fontsize=14, loc='center right')
     
     # Add threshold annotation with improved positioning
-    ax.text(0.02, 0.98, f'Critical threshold: Ki + Fi = {threshold}=wv²/wr\nλ range: 1 to 100,000', 
-            transform=ax.transAxes, verticalalignment='top',
+    ax.text(0.98, 0.98, f'Critical threshold: Ki + Fi = {threshold}=wv²/wr\nλ range: 1 to 100,000', 
+            transform=ax.transAxes, 
+            horizontalalignment='right', verticalalignment='top',
             bbox=dict(boxstyle="round,pad=0.5", facecolor="lightblue", alpha=0.9),
-            fontsize=11)
-    
+            fontsize=13)
+        
     plt.tight_layout()
-    plt.savefig('proposition4_compressed_verification.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig('proposition4_verification.pdf', dpi=300, bbox_inches='tight')
     print(f"\n✅ Compressed verification saved as 'proposition4_compressed_verification.pdf'")
     
     # Summary
