@@ -37,7 +37,7 @@ class MixedGaussianConfig:
     @staticmethod
     def get_cluster_sigmas(grid_size: int):
         """Get cluster standard deviations scaled to grid size"""
-        return [grid_size * 0.15, grid_size * 0.16, grid_size * 0.12]
+        return [grid_size * 0.15 *0.5, grid_size * 0.16 *0.5, grid_size * 0.12 *0.5]
 
 class ToyGeoData(GeoData):
     """Toy geographic data for visualization"""
@@ -96,7 +96,9 @@ class ToyGeoData(GeoData):
             return float('inf')
     
     def get_area(self, block_id):
-        return 1.0
+        # Area per block = total service region area / number of blocks
+        # Service region: 10 miles × 10 miles = 100 square miles
+        return 100.0 / self.n_blocks
     
     def get_K(self, block_id):
         return 2.0
@@ -373,7 +375,7 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     
     # Add colorbar for demand
     cbar1 = plt.colorbar(im1, ax=ax1, shrink=0.8)
-    cbar1.set_label('Demand density (nominal)')
+    cbar1.set_label('Demand density')
     
     # Add legend for left panel
     from matplotlib.patches import Patch
@@ -520,7 +522,7 @@ def main():
     depot_id, district_roots, assignment, obj_val, district_info = partition.random_search(
         max_iters=20,
         prob_dict=prob_dict,
-        Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+        Lambda=100, wr=1.0, wv=10.0, beta=0.7120,
         Omega_dict=Omega_dict,
         J_function=J_function
     )
@@ -549,8 +551,8 @@ def main():
                              dispatch_intervals, prob_dict, Omega_dict, district_info)
     
     # Save figure as PDF
-    plt.savefig('rs_solution_visualization.pdf', dpi=300, bbox_inches='tight')
-    print("Visualization saved as 'rs_solution_visualization.pdf'")
+    plt.savefig('rs_optimal_design.pdf', dpi=300, bbox_inches='tight')
+    print("Visualization saved as 'rs_optimal_design.pdf'")
     
     plt.show()
 

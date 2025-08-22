@@ -52,7 +52,7 @@ class MixedGaussianConfig:
     @staticmethod
     def get_cluster_sigmas(grid_size: int):
         """Get cluster standard deviations scaled to grid size"""
-        return [grid_size * 0.15, grid_size * 0.16, grid_size * 0.12]
+        return [grid_size * 0.15 * 0.5, grid_size * 0.16 * 0.5, grid_size * 0.12 * 0.5]
 
 class ToyGeoData(GeoData):
     """Toy geographic data for simulation testing with fixed service region"""
@@ -124,7 +124,9 @@ class ToyGeoData(GeoData):
             return (0.0, 0.0)
     
     def get_area(self, block_id):
-        return 1.0
+        # Area per block = total service region area / number of blocks
+        # Service region: 10 miles × 10 miles = 100 square miles
+        return 100.0 / self.n_blocks
     
     def get_K(self, block_id):
         return 2.0
