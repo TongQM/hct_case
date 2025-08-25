@@ -200,30 +200,31 @@ def solve_worst_case_with_cqcp(geodata, empirical_prob_dict, epsilon, seed=42):
 
 def measure_uniformity(distribution):
     """
-    Measure uniformity using max_mass - min_mass metric
+    Measure uniformity using normalized entropy metric
     
     Returns:
-        uniformity: 1.0 - (max_mass - min_mass) / (1/n_blocks)
-        This gives 1.0 for perfect uniform distribution, 0.0 for maximally non-uniform
+        uniformity: entropy / max_entropy, where max_entropy = log(n)
+        This gives 1.0 for perfect uniform distribution, 0.0 for maximally concentrated
     """
     n = len(distribution)
     dist_normalized = distribution / np.sum(distribution) if np.sum(distribution) > 0 else np.ones(n) / n
     
-    max_mass = np.max(dist_normalized)
-    min_mass = np.min(dist_normalized)
+    # Add small epsilon to avoid log(0)
+    dist_safe = dist_normalized + 1e-12
+    
+    # Calculate entropy: H = -sum(p_i * log(p_i))
+    entropy = -np.sum(dist_safe * np.log(dist_safe))
+    max_entropy = np.log(n)  # Maximum entropy for uniform distribution
+    
+    # Normalize entropy to [0, 1] scale
+    uniformity = entropy / max_entropy if max_entropy > 0 else 0.0
     
     # Debug output
     uniform_mass = 1.0 / n
+    max_mass = np.max(dist_normalized)
+    min_mass = np.min(dist_normalized)
+    print(f"  Entropy: {entropy:.6f}, Max entropy: {max_entropy:.6f}, Uniformity: {uniformity:.6f}")
     print(f"  Max mass: {max_mass:.6f}, Min mass: {min_mass:.6f}, Uniform mass: {uniform_mass:.6f}")
-    print(f"  Range: {max_mass - min_mass:.6f}, Max possible range: 1.0")
-    
-    # For perfectly uniform distribution: max = min = 1/n
-    uniform_mass = 1.0 / n
-    max_possible_range = 1.0 - 0.0  # Theoretical max range
-    
-    # Uniformity metric: 1.0 for uniform, closer to 0.0 for non-uniform
-    mass_range = max_mass - min_mass
-    uniformity = 1.0 - (mass_range / max_possible_range)
     
     return max(0.0, min(1.0, uniformity))  # Clamp to [0, 1]
 
@@ -344,7 +345,7 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
         print("CQCP-BASED CUTOFF ANALYSIS")
         print("=" * 60)
         print(f"Distance metric: Euclidean distance on 10×10 mile grid")
-        print(f"Uniformity metric: 1.0 - (max_mass - min_mass)")
+        print(f"Uniformity metric: normalized entropy (H / log(n))")
         print(f"Uniformity threshold: {uniformity_threshold:.1%}")
         print(f"Critical ε: {epsilon_critical:.3f}")
         print(f"Sample size cutoff n* = {n_star}")
@@ -374,7 +375,7 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
                  fmt='bo-', linewidth=2, markersize=6, capsize=4)
     if n_star is not None:
         ax1.axvline(x=n_star, color='red', linestyle='--', linewidth=3, 
-                    label=f'Critical n* = {n_star}\n(CQCP-based, max-min range increases)')
+                    label=f'Critical n* = {n_star}\n(CQCP-based, entropy-based uniformity)')
         
         # Fill regime regions
         ax1.fill_between(sample_sizes[sample_sizes <= n_star], 0.5, 1.0, 
@@ -446,7 +447,7 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
         ax4.set_title('Data-Driven Distribution Example', fontsize=15)
     
     plt.tight_layout()
-    plt.savefig('cqcp_proper_sample_cutoff_validation.pdf', dpi=300, bbox_inches='tight')
+    plt.savefig('sample_cutoff_validation.pdf', dpi=300, bbox_inches='tight')
     print("✅ CQCP validation plots saved as 'cqcp_proper_sample_cutoff_validation.pdf'")
     
     return fig
