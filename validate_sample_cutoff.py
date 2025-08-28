@@ -476,7 +476,9 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
         uniform_dist = results['worst_case_distributions'][small_n_idx]
         uniform_grid = uniform_dist.reshape(grid_size, grid_size)
         
-        im1 = ax3.imshow(uniform_grid, cmap='Blues', origin='lower', vmin=0, vmax=np.max(uniform_grid)*1.2, extent=[0, grid_size, 0, grid_size])
+        # Use consistent color scale for both plots
+        vmax_shared = max(np.max(uniform_grid), 0.08)  # Ensure we can see both uniform and concentrated
+        im1 = ax3.imshow(uniform_grid, cmap='YlOrRd', origin='lower', vmin=0, vmax=vmax_shared, extent=[0, grid_size, 0, grid_size])
         
         # Add empirical samples as blue dots (samples specific to this n)
         if small_n in results['empirical_samples']:
@@ -500,7 +502,14 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
         nonuniform_dist = results['worst_case_distributions'][large_n_idx]
         nonuniform_grid = nonuniform_dist.reshape(grid_size, grid_size)
         
-        im2 = ax4.imshow(nonuniform_grid, cmap='Reds', origin='lower', vmin=0, vmax=np.max(nonuniform_grid)*1.2, extent=[0, grid_size, 0, grid_size])
+        # Use same color scale as uniform plot
+        if len(results['worst_case_distributions']) > 0:
+            uniform_dist_ref = results['worst_case_distributions'][8]  # Same as small_n_idx
+            vmax_shared = max(np.max(uniform_dist_ref), np.max(nonuniform_grid), 0.08)
+        else:
+            vmax_shared = max(np.max(nonuniform_grid), 0.08)
+            
+        im2 = ax4.imshow(nonuniform_grid, cmap='YlOrRd', origin='lower', vmin=0, vmax=vmax_shared, extent=[0, grid_size, 0, grid_size])
         
         # Add empirical samples as blue dots (samples specific to this n)
         if large_n in results['empirical_samples']:
