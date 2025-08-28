@@ -194,7 +194,7 @@ def simulate_service_level_realistic(Vi, Ci, depot_location, demand_sampler,
     
     Args:
         Vi: Number of vehicles (integer)
-        Ci: Dispatch interval  
+        Ci: Dispatch Subinterval  
         depot_location: (x, y) depot coordinates
         demand_sampler: Function to sample demand locations
         Lambda: Demand intensity (arrivals per unit time)
@@ -208,7 +208,7 @@ def simulate_service_level_realistic(Vi, Ci, depot_location, demand_sampler,
     np.random.seed(seed)
     
     T_i = Ci * Vi  # Available time budget
-    lambda_arrival = Lambda * Ci  # Expected arrivals in dispatch interval
+    lambda_arrival = Lambda * Ci  # Expected arrivals in dispatch Subinterval
     
     travel_times = []
     successful_dispatches = 0
@@ -259,7 +259,7 @@ def verify_propositions_realistic(use_bhh=False, n_simulations=30, n_error_runs=
     Lambda = 17.0        # Demand intensity (arrivals per hour)
     zeta = 0.95         # Target service level (95%)
     
-    # Range of dispatch intervals (hours)
+    # Range of dispatch Subintervals (hours)
     C_values = np.logspace(-1, 1, 100)  # From 0.1 to 10 hours (increased resolution)
     
     print("=" * 80)
@@ -401,7 +401,7 @@ def create_realistic_fleet_plots(C_values, fleet_bounds, upper_envelopes, actual
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 12))
     
-    # Plot 1: Fleet size vs dispatch interval
+    # Plot 1: Fleet size vs dispatch Subinterval
     ax1.loglog(C_values, fleet_bounds, 'b-', linewidth=3, 
                label='Fleet Bound Vi (Prop 5)')
     ax1.loglog(C_values, upper_envelopes, 'g--', linewidth=3, 
@@ -418,9 +418,9 @@ def create_realistic_fleet_plots(C_values, fleet_bounds, upper_envelopes, actual
     ax1.set_xscale('log')
     ax1.set_yscale('log')
     
-    ax1.set_xlabel('Dispatch Interval Ci (hours)', fontsize=14)
+    ax1.set_xlabel('Dispatch Subinterval Ci (hours)', fontsize=14)
     ax1.set_ylabel('Fleet Size Vi (vehicles)', fontsize=14)
-    # ax1.set_title('Fleet Size Requirements vs Dispatch Interval', fontsize=14)
+    # ax1.set_title('Fleet Size Requirements vs Dispatch Subinterval', fontsize=14)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=12)
     ax1.tick_params(axis='both', which='major', labelsize=12)
@@ -440,7 +440,7 @@ def create_realistic_fleet_plots(C_values, fleet_bounds, upper_envelopes, actual
                 label='Perfect Service Level = 1.0')
     ax2.set_xscale('log')
     
-    ax2.set_xlabel('Dispatch Interval Ci (hours)', fontsize=14)
+    ax2.set_xlabel('Dispatch Subinterval Ci (hours)', fontsize=14)
     ax2.set_ylabel('Service Level SL_i(Vi)', fontsize=14)
     # ax2.set_title('Service Level Verification (Proposition 5)', fontsize=14)
     ax2.grid(True, alpha=0.3)
@@ -462,7 +462,7 @@ def create_realistic_fleet_plots(C_values, fleet_bounds, upper_envelopes, actual
     ax3.axhline(y=1.0, color='black', linestyle='-', alpha=0.5, 
                 label='Perfect Bound (ratio = 1)')
     ax3.set_xscale('log')
-    ax3.set_xlabel('Dispatch Interval Ci (hours)', fontsize=14)
+    ax3.set_xlabel('Dispatch Subinterval Ci (hours)', fontsize=14)
     ax3.set_ylabel('V_actual / V_bound', fontsize=14)
     # ax3.set_title('Tightness of Fleet Size Bound', fontsize=14)
     ax3.grid(True, alpha=0.3)
@@ -484,7 +484,7 @@ def create_realistic_fleet_plots(C_values, fleet_bounds, upper_envelopes, actual
                 label='Perfect envelope (gap = 0)')
     ax4.set_xscale('log')
     
-    ax4.set_xlabel('Dispatch Interval Ci (hours)', fontsize=14)
+    ax4.set_xlabel('Dispatch Subinterval Ci (hours)', fontsize=14)
     ax4.set_ylabel('Upper Envelope Gap (vehicles)', fontsize=14)
     # ax4.set_title('Upper Envelope Overestimate (Proposition 6)', fontsize=14)
     ax4.grid(True, alpha=0.3)

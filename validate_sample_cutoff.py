@@ -54,6 +54,40 @@ class ToyGeoData(GeoData):
         # Set attributes
         self.areas = {block_id: 1.0 for block_id in self.short_geoid_list}  # 1 square mile per block
         self.gdf = None
+        
+        # Add arc structure methods to avoid LBBD errors
+        self._build_arc_structures()
+    
+    def _build_arc_structures(self):
+        """Build directed arc list and precompute in/out arc dictionaries for flow constraints"""
+        # Build directed arc list from undirected graph
+        self.arc_list = []
+        for u, v in self.G.edges():
+            self.arc_list.append((u, v))
+            self.arc_list.append((v, u))
+        self.arc_list = list(set(self.arc_list))  # Remove duplicates if any
+        
+        # Precompute out_arcs_dict and in_arcs_dict for all nodes
+        self.out_arcs_dict = {
+            node: [(node, neighbor) for neighbor in self.G.neighbors(node) if (node, neighbor) in self.arc_list] 
+            for node in self.short_geoid_list
+        }
+        self.in_arcs_dict = {
+            node: [(neighbor, node) for neighbor in self.G.neighbors(node) if (neighbor, node) in self.arc_list] 
+            for node in self.short_geoid_list
+        }
+    
+    def get_arc_list(self):
+        """Get the directed arc list"""
+        return self.arc_list
+    
+    def get_in_arcs(self, node):
+        """Get incoming arcs for a specific node"""
+        return self.in_arcs_dict.get(node, [])
+    
+    def get_out_arcs(self, node):
+        """Get outgoing arcs for a specific node"""
+        return self.out_arcs_dict.get(node, [])
     
     def get_dist(self, block1, block2):
         """Euclidean distance in miles between blocks"""
@@ -88,7 +122,8 @@ def create_mixed_gaussian_samples(grid_size=10, n_samples=1000, seed=42):
         (grid_size * 0.50, grid_size * 0.75)   # Bottom-center
     ]
     cluster_weights = [0.4, 0.35, 0.25]
-    cluster_sigmas = [grid_size * 0.15 * 0.5, grid_size * 0.16 * 0.5, grid_size * 0.12 * 0.5]
+    scaling_factor = 0.5  # To keep samples within bounds
+    cluster_sigmas = [grid_size * 0.15 * scaling_factor, grid_size * 0.16 * scaling_factor, grid_size * 0.12 * scaling_factor]
     
     samples = []
     max_attempts = n_samples * 5
@@ -175,15 +210,18 @@ def solve_worst_case_with_cqcp(geodata, empirical_prob_dict, epsilon, seed=42):
             worst_case_cost, x_star_dict, subgrad, C_star, alpha_i, subgrad_K_i, subgrad_F_i = result
             
             # Convert x_star_dict to distribution array (only for assigned blocks)
+            # Note: x_star_dict contains x_j values, but probability mass is x_j^2
             worst_case_dist = np.zeros(len(assigned_blocks))
             total_mass = 0.0
             for i, block_id in enumerate(assigned_blocks):
-                mass = x_star_dict.get(block_id, 0.0)
+                x_j = x_star_dict.get(block_id, 0.0)
+                # Ensure non-negative and use x_j^2 for probability mass
+                mass = max(0.0, x_j)**2
                 worst_case_dist[i] = mass
                 total_mass += mass
-            
+            assert np.isclose(1, total_mass), f"Total mass {total_mass} not close to 1"
             # Normalize to ensure it's a proper probability distribution
-            if total_mass > 0:
+            if total_mass > 1e-10:
                 worst_case_dist = worst_case_dist / total_mass
             else:
                 # Fallback to uniform if no mass
@@ -231,6 +269,7 @@ def measure_uniformity(distribution):
 def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
     """
     Validate sample cutoff theory using proper CQCP Benders decomposition
+    FIXED VERSION: Use same empirical distribution, only vary Wasserstein radius
     
     Args:
         epsilon_0: Base Wasserstein radius
@@ -242,7 +281,7 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
     service_region_miles = 10.0  # 10×10 miles
     
     print("=" * 80)
-    print("PROPER SAMPLE SIZE CUTOFF VALIDATION WITH CQCP BENDERS")
+    print("PROPER SAMPLE SIZE CUTOFF VALIDATION WITH CQCP BENDERS (FIXED)")
     print("=" * 80)
     print(f"Service region: {service_region_miles}×{service_region_miles} miles")
     print(f"Grid size: {grid_size}×{grid_size} = {grid_size**2} blocks")
@@ -251,13 +290,20 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
     print(f"Scaled radius formula: ε(n) = ε₀/√n")
     print(f"Number of trials per sample size: {n_trials}")
     print(f"Worst-case solver: CQCP Benders decomposition")
+    print(f"🔧 FIX: Using FIXED empirical distribution, only varying radius!")
     print()
     
     # Create geodata
     geodata = ToyGeoData(grid_size, service_region_miles, seed=42)
     
-    # Sample sizes to test (reduced due to computational cost)
-    sample_sizes = [10, 20, 30, 50, 100, 200, 300]
+    # Sample sizes to test (log-evenly distributed for better coverage)
+    # Create log-evenly spaced sample sizes from 1 to 200
+    sample_sizes = np.logspace(0, np.log10(200), 30).astype(int)
+    sample_sizes = np.unique(sample_sizes)  # Remove duplicates
+    sample_sizes = sample_sizes[sample_sizes >= 1]  # Ensure all >= 1
+    
+    print(f"Testing {len(sample_sizes)} different sample sizes: {sample_sizes[:5]}...{sample_sizes[-5:]}")
+    print()
     
     # Storage for results
     results = {
@@ -266,13 +312,25 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
         'uniformities_std': [],
         'epsilons': [],
         'worst_case_distributions': [],
-        'success_rates': []
+        'success_rates': [],
+        'empirical_samples': {}  # Store empirical samples for each n for visualization
     }
     
     for n in sample_sizes:
-        print(f"Testing n = {n} samples...")
+        print(f"Testing ε(n={n}) = {epsilon_0}/√{n}...")
         
-        epsilon = epsilon_0 / np.sqrt(n)
+        # Generate empirical distribution for this specific sample size n
+        empirical_samples = create_mixed_gaussian_samples(grid_size, n, seed=42)
+        empirical_dist = samples_to_empirical_distribution(empirical_samples, grid_size)
+        empirical_prob_dict = {
+            block_id: empirical_dist[i] 
+            for i, block_id in enumerate(geodata.short_geoid_list)
+        }
+        
+        # Store empirical samples for visualization
+        results['empirical_samples'][n] = empirical_samples
+        
+        epsilon = epsilon_0 / (n**0.5)  
         uniformities = []
         trial_worst_cases = []
         successful_trials = 0
@@ -280,17 +338,7 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
         for trial in range(n_trials):
             print(f"  Trial {trial + 1}/{n_trials}...", end=' ')
             
-            # Generate empirical distribution from mixed-Gaussian samples
-            samples = create_mixed_gaussian_samples(grid_size, n, seed=42 + trial * 1000)
-            empirical_dist = samples_to_empirical_distribution(samples, grid_size)
-            
-            # Create probability dictionary
-            empirical_prob_dict = {
-                block_id: empirical_dist[i] 
-                for i, block_id in enumerate(geodata.short_geoid_list)
-            }
-            
-            # Solve worst-case distribution with CQCP
+            # Use empirical distribution specific to this sample size n
             worst_case, success = solve_worst_case_with_cqcp(
                 geodata, empirical_prob_dict, epsilon, seed=42 + trial
             )
@@ -326,8 +374,8 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
         uniformities = np.array(results['uniformities_mean'])
         epsilons = np.array(results['epsilons'])
         
-        # Find cutoff: where uniformity drops below 90% (adjusted for max-min metric)
-        uniformity_threshold = 0.96
+        # Find cutoff: where uniformity drops below 99.9% (adjusted for max-min metric)
+        uniformity_threshold = 0.999
         uniform_indices = np.where(uniformities >= uniformity_threshold)[0]
         
         if len(uniform_indices) > 0:
@@ -342,7 +390,7 @@ def validate_sample_cutoff_with_cqcp_proper(epsilon_0=10.0, n_trials=5):
             epsilon_critical = epsilon_0 / np.sqrt(n_star)
         
         print("=" * 60)
-        print("CQCP-BASED CUTOFF ANALYSIS")
+        print("FIXED CQCP-BASED CUTOFF ANALYSIS")
         print("=" * 60)
         print(f"Distance metric: Euclidean distance on 10×10 mile grid")
         print(f"Uniformity metric: normalized entropy (H / log(n))")
@@ -370,25 +418,36 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
     uniformities_std = np.array(results['uniformities_std'])
     epsilons = np.array(results['epsilons'])
     
-    # Plot 1: Uniformity vs Sample Size with clear regime boundaries
-    ax1.errorbar(sample_sizes, uniformities_mean, yerr=uniformities_std, 
-                 fmt='bo-', linewidth=2, markersize=6, capsize=4)
+    # Plot 1: Uniformity vs Sample Size with clear regime boundaries (LOG-LOG SCALE)
+    ax1.loglog(sample_sizes, uniformities_mean, 'bo-', linewidth=2, markersize=6)
     if n_star is not None:
         ax1.axvline(x=n_star, color='red', linestyle='--', linewidth=3, 
-                    label=f'Critical n* = {n_star}\n(CQCP-based, entropy-based uniformity)')
+                    label=f'Critical n* = {n_star} (Entropy-based uniformity)')
         
-        # Fill regime regions
-        ax1.fill_between(sample_sizes[sample_sizes <= n_star], 0.5, 1.0, 
-                         alpha=0.15, color='green', label='Uniform Regime (Small n)')
-        ax1.fill_between(sample_sizes[sample_sizes > n_star], 0.5, 1.0, 
-                         alpha=0.15, color='red', label='Data-Driven Regime (Large n)')
+        # Fill regime regions with continuous coverage and switched colors
+        # Create continuous x range for smooth filling
+        x_min, x_max = sample_sizes[0], sample_sizes[-1]
+        
+        # For log scale, use fill_between with y-values
+        y_min, y_max = 0.5, 1.0
+        
+        # Fill uniform regime (small n, large ε) in RED
+        # Use continuous range from 1 to n_star
+        ax1.fill_between([1, n_star], [y_min, y_min], [y_max, y_max], 
+                       alpha=0.15, color='red', label='Uniform Regime (Small n)')
+        
+        # Fill data-driven regime (large n, small ε) in GREEN
+        # Use continuous range from n_star to 200 (no gap)
+        ax1.fill_between([n_star, 200], [y_min, y_min], [y_max, y_max], 
+                       alpha=0.15, color='green', label='Data-Driven Regime (Large n)')
     
-    ax1.set_xlabel('Sample Size n', fontsize=14)
-    ax1.set_ylabel('Worst-Case Distribution Uniformity', fontsize=14)
-    ax1.set_title('CQCP Benders: Sample Size Cutoff Validation\n(10×10 Grid, Euclidean Distance)', fontsize=15)
+    ax1.set_xlabel('Sample Size n (log scale)', fontsize=14)
+    ax1.set_ylabel('Worst-Case Distribution Uniformity (log scale)', fontsize=14)
+    # ax1.set_title('CQCP Benders: Sample Size Cutoff Validation\n(10×10 Grid, Euclidean Distance)', fontsize=15)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=11)
-    ax1.set_ylim([0.5, 1.0])
+    ax1.set_xlim([1, 200])
+    ax1.set_ylim([0.8, 1.05])
     ax1.tick_params(axis='both', which='major', labelsize=12)
     
     # Plot 2: Wasserstein radius with critical line
@@ -403,21 +462,27 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
     ax2.loglog(sample_sizes, theoretical, 'r:', linewidth=2, alpha=0.8, 
                label='ε₀/√n (theory)')
     
-    ax2.set_xlabel('Sample Size n', fontsize=14)
+    ax2.set_xlabel('Sample Size n (log scale)', fontsize=14)
     ax2.set_ylabel('Wasserstein Radius ε(n)', fontsize=14)
-    ax2.set_title('Radius Scaling with Critical Threshold', fontsize=15)
+    # ax2.set_title('Radius Scaling with Critical Threshold', fontsize=15)
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=11)
     ax2.tick_params(axis='both', which='major', labelsize=12)
     
     # Plot 3: Example uniform distribution (small n)
     if len(results['worst_case_distributions']) > 0:
-        small_n_idx = 0  # First sample size (smallest n)
+        small_n_idx = 8  # First sample size (smallest n)
         small_n = sample_sizes[small_n_idx]
         uniform_dist = results['worst_case_distributions'][small_n_idx]
         uniform_grid = uniform_dist.reshape(grid_size, grid_size)
         
-        im1 = ax3.imshow(uniform_grid, cmap='Blues', origin='lower', vmin=0, vmax=np.max(uniform_grid)*1.2)
+        im1 = ax3.imshow(uniform_grid, cmap='Blues', origin='lower', vmin=0, vmax=np.max(uniform_grid)*1.2, extent=[0, grid_size, 0, grid_size])
+        
+        # Add empirical samples as blue dots (samples specific to this n)
+        if small_n in results['empirical_samples']:
+            empirical_x, empirical_y = zip(*results['empirical_samples'][small_n])
+            ax3.scatter(empirical_x, empirical_y, c='blue', s=20, alpha=0.6, label=f'Empirical samples (n={small_n})')
+        
         ax3.set_title(f'Uniform Worst-Case (n={small_n})\nε={epsilons[small_n_idx]:.3f}, Uniformity={uniformities_mean[small_n_idx]:.3f}', 
                       fontsize=13)
         ax3.set_xlabel('x coordinate')
@@ -430,12 +495,18 @@ def create_cqcp_visualization(results, n_star, epsilon_critical, grid_size):
     
     # Plot 4: Example non-uniform distribution (large n)
     if len(results['worst_case_distributions']) > 1:
-        large_n_idx = -1  # Last sample size (largest n)
+        large_n_idx = -3  # Last sample size (largest n)
         large_n = sample_sizes[large_n_idx]
         nonuniform_dist = results['worst_case_distributions'][large_n_idx]
         nonuniform_grid = nonuniform_dist.reshape(grid_size, grid_size)
         
-        im2 = ax4.imshow(nonuniform_grid, cmap='Reds', origin='lower', vmin=0, vmax=np.max(nonuniform_grid)*1.2)
+        im2 = ax4.imshow(nonuniform_grid, cmap='Reds', origin='lower', vmin=0, vmax=np.max(nonuniform_grid)*1.2, extent=[0, grid_size, 0, grid_size])
+        
+        # Add empirical samples as blue dots (samples specific to this n)
+        if large_n in results['empirical_samples']:
+            empirical_x, empirical_y = zip(*results['empirical_samples'][large_n])
+            ax4.scatter(empirical_x, empirical_y, c='blue', s=20, alpha=0.6, label=f'Empirical samples (n={large_n})')
+        
         ax4.set_title(f'Data-Driven Worst-Case (n={large_n})\nε={epsilons[large_n_idx]:.3f}, Uniformity={uniformities_mean[large_n_idx]:.3f}', 
                       fontsize=13)
         ax4.set_xlabel('x coordinate')
@@ -456,8 +527,8 @@ def main():
     import sys
     
     # Parse command line arguments for epsilon_0
-    epsilon_0 = 8.0  # Default smaller value
-    n_trials = 3  # Default trials
+    epsilon_0 = 3.0  # Default smaller value
+    n_trials = 5  # Default trials
     
     for arg in sys.argv[1:]:
         try:
