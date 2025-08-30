@@ -63,6 +63,7 @@ class DesignResult:
     depot_id: str
     district_roots: List[str]
     assignment: np.ndarray
+    dispatch_intervals: Dict[str, float]  # T_star for each district
     obj_val: float
     district_info: List
     success: bool
@@ -288,10 +289,22 @@ def optimize_service_design(geo_data: ToyGeoData,
         
         print(f"      {design_type} design objective: {obj_val:.2f}")
         
+        # Extract dispatch intervals from district_info (same as simulate_service_designs.py)
+        dispatch_intervals = {}
+        for district_data in district_info:
+            if len(district_data) >= 5:
+                cost, root, K_i, F_i, T_star = district_data[:5]
+                dispatch_intervals[root] = T_star
+            else:
+                # Fallback for old format
+                cost, root, K_i, F_i, T_star = district_data
+                dispatch_intervals[root] = T_star
+        
         return DesignResult(
             depot_id=depot_id,
             district_roots=district_roots,
             assignment=assignment,
+            dispatch_intervals=dispatch_intervals,
             obj_val=obj_val,
             district_info=district_info,
             success=True
@@ -301,7 +314,7 @@ def optimize_service_design(geo_data: ToyGeoData,
         print(f"      {design_type} optimization failed: {e}")
         return DesignResult(
             depot_id="", district_roots=[], assignment=np.array([]),
-            obj_val=float('inf'), district_info=[], success=False
+            dispatch_intervals={}, obj_val=float('inf'), district_info=[], success=False
         )
 
 def solve_worst_case_with_cqcp(geodata, empirical_prob_dict, epsilon, seed=42):
@@ -360,11 +373,80 @@ def solve_worst_case_with_cqcp(geodata, empirical_prob_dict, epsilon, seed=42):
         print(f"    CQCP solver failed: {e}")
         return None, False
 
+def sample_demand_points_in_district(geo_data, assigned_blocks, dispatch_demand, sampler):
+    """Sample demand points within assigned blocks of a district"""
+    points = []
+    attempts = 0
+    max_attempts = dispatch_demand * 5
+    
+    while len(points) < dispatch_demand and attempts < max_attempts:
+        # Sample a point from true distribution
+        candidate_points = sampler(1)
+        if candidate_points:
+            x, y = candidate_points[0]
+            # Determine which block this point falls into
+            grid_size = geo_data.grid_size
+            block_row = int(np.clip(np.floor(x), 0, grid_size - 1))
+            block_col = int(np.clip(np.floor(y), 0, grid_size - 1))
+            block_idx = block_row * grid_size + block_col
+            block_id = geo_data.short_geoid_list[block_idx]
+            
+            # Accept if point is in assigned blocks
+            if block_id in assigned_blocks:
+                # Convert to miles coordinates
+                x_miles = x * geo_data.miles_per_grid_unit
+                y_miles = y * geo_data.miles_per_grid_unit
+                points.append((x_miles, y_miles))
+        
+        attempts += 1
+    
+    return points
+
+def calculate_simple_tsp_length(demand_points):
+    """Calculate TSP length using MST approximation for speed"""
+    if len(demand_points) <= 1:
+        return 0.0
+    
+    if len(demand_points) == 2:
+        p1, p2 = demand_points
+        return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
+    
+    # MST approximation: sum of all pairwise distances, take MST
+    points = np.array(demand_points)
+    n = len(points)
+    
+    # Simple MST using Prim's algorithm
+    in_mst = [False] * n
+    key = [float('inf')] * n
+    key[0] = 0.0
+    mst_weight = 0.0
+    
+    for _ in range(n):
+        # Find minimum key vertex not in MST
+        u = -1
+        for v in range(n):
+            if not in_mst[v] and (u == -1 or key[v] < key[u]):
+                u = v
+        
+        in_mst[u] = True
+        mst_weight += key[u]
+        
+        # Update key values of adjacent vertices
+        for v in range(n):
+            if not in_mst[v]:
+                dist = np.sqrt((points[u][0] - points[v][0])**2 + (points[u][1] - points[v][1])**2)
+                if dist < key[v]:
+                    key[v] = dist
+    
+    # TSP ≈ 1.5 × MST for random points
+    return mst_weight * 1.5
+
 def evaluate_design_via_simulation(geo_data: ToyGeoData,
                                  design: DesignResult,
                                  prob_dict: Dict[str, float],
-                                 eval_type: str) -> SimulationResult:
-    """Evaluate FIXED design performance via ACTUAL vehicle simulation under GIVEN distribution"""
+                                 eval_type: str,
+                                 trial_seed: int = 42) -> SimulationResult:
+    """Evaluate design performance via PROPER vehicle simulation matching simulate_service_designs.py"""
     
     if not design.success:
         return SimulationResult(
@@ -375,30 +457,22 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
         )
     
     try:
-        SERVICE_HOURS = 12.0  # 8am to 8pm = 12 hours
+        # Constants matching simulate_service_designs.py
+        SERVICE_HOURS = 12.0  # 8am to 8pm
         daily_demand_rate = 100.0
         wr = 1.0  # Time-to-cost conversion factor
-        wv = 10.0  # Vehicle speed (miles/minute)
+        wv = 10.0  # Vehicle speed (miles/hour)
         
         block_ids = geo_data.short_geoid_list
         N = len(block_ids)
         
-        # Generate daily demand from probability distribution
-        daily_demands = {}
-        total_demand = 0
+        # No need to generate daily demands upfront - we'll calculate district arrival rates
+        # and sample per dispatch using the given prob_dict distribution
         
-        for block_id in block_ids:
-            # Expected demand = daily_demand_rate * probability
-            expected_demand = daily_demand_rate * prob_dict.get(block_id, 0.0)
-            # Use expected demand directly to reduce randomness
-            demand = int(expected_demand + 0.5)  # Round to nearest integer
-            daily_demands[block_id] = demand
-            total_demand += demand
-        
-        # Generate ODD features for simulation
+        # Generate ODD features
         Omega_dict, J_function = create_odd_features(geo_data.grid_size)
         
-        # Initialize cost tracking
+        # District cost calculations (like simulate_service_designs.py)
         district_costs = []
         max_wait_time = 0.0
         max_travel_time = 0.0
@@ -406,80 +480,131 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
         for root_id in design.district_roots:
             root_idx = block_ids.index(root_id)
             
-            # Get blocks assigned to this district from FIXED design
+            # Get assigned blocks from FIXED design
             assigned_blocks = []
-            district_demand = 0
             for i in range(N):
                 if round(design.assignment[i, root_idx]) == 1:
                     block_id = block_ids[i]
                     assigned_blocks.append(block_id)
-                    district_demand += daily_demands[block_id]
             
-            if not assigned_blocks or district_demand == 0:
+            if not assigned_blocks:
                 continue
             
-            # District costs calculation (simplified from simulate_service_designs.py)
-            T_star = 1.0  # Default dispatch interval (design doesn't store this)
+            # Calculate district arrival rate from the given distribution (nominal or worst-case)
+            district_prob_mass = sum(prob_dict.get(block_id, 0.0) for block_id in assigned_blocks)
+            district_arrival_rate = daily_demand_rate * district_prob_mass  # Demands per day
             
-            # Linehaul cost (amortized over service hours)
-            linehaul_cost = 3.0 * SERVICE_HOURS  # K_i * SERVICE_HOURS
+            if district_arrival_rate <= 0:
+                continue
             
-            # ODD cost computation
-            odd_cost = 0.0
+            # FIXED: Use actual dispatch interval from design
+            T_star = design.dispatch_intervals[root_id]
+            
+            # Number of dispatches during service hours
+            num_dispatches = max(1, int(np.ceil(SERVICE_HOURS / T_star)))
+            
+            # FIXED: Proper linehaul cost = depot to district distance / T_star
+            min_depot_dist = min(geo_data.get_dist(design.depot_id, block_id) 
+                               for block_id in assigned_blocks)
+            district_linehaul = min_depot_dist / T_star
+            
+            # ODD cost: maximum ODD features in district (amortized over T_star)
+            district_omega = np.zeros(2)
             for block_id in assigned_blocks:
                 if block_id in Omega_dict:
-                    block_demand = daily_demands[block_id]
-                    if block_demand > 0:
-                        omega = Omega_dict[block_id]
-                        odd_cost += J_function(omega) * (block_demand / daily_demand_rate)
+                    district_omega = np.maximum(district_omega, Omega_dict[block_id])
+            district_odd = J_function(district_omega) / T_star  # Fixed cost amortized over dispatch interval
             
-            # Travel cost (routing cost for serving demands)
-            travel_cost = 0.0
-            for block_id in assigned_blocks:
-                if daily_demands[block_id] > 0:
-                    dist_to_block = geo_data.get_dist(root_id, block_id)
-                    travel_cost += dist_to_block * daily_demands[block_id] * 0.1  # Cost per mile per trip
+            # FIXED: TSP-based travel cost with Poisson demand per dispatch
+            district_travel = 0.0
+            for dispatch in range(num_dispatches):
+                # Sample number of demands for this dispatch using district arrival rate
+                dispatch_lambda = district_arrival_rate * T_star / SERVICE_HOURS  # Expected demands per dispatch
+                # Use trial_seed for reproducible trials with different random realizations
+                np.random.seed(trial_seed + hash((root_id, dispatch)) % 1000)
+                dispatch_demand = np.random.poisson(dispatch_lambda)
+                
+                if dispatch_demand > 0:
+                    # Sample spatial demand locations using the given prob_dict distribution
+                    demand_points = []
+                    
+                    # Create block probability array within this district for spatial sampling
+                    district_block_probs = {}
+                    district_total_prob = 0.0
+                    for block_id in assigned_blocks:
+                        prob = prob_dict.get(block_id, 0.0)
+                        district_block_probs[block_id] = prob
+                        district_total_prob += prob
+                    
+                    if district_total_prob > 0:
+                        # Normalize probabilities within district
+                        for block_id in district_block_probs:
+                            district_block_probs[block_id] /= district_total_prob
+                        
+                        # Sample demand locations within district
+                        for _ in range(dispatch_demand):
+                            # Sample which block this demand occurs in
+                            block_choices = list(district_block_probs.keys())
+                            block_probs = list(district_block_probs.values())
+                            sampled_block = np.random.choice(block_choices, p=block_probs)
+                            
+                            # Sample random location within that block
+                            block_idx = block_ids.index(sampled_block)
+                            block_row = block_idx // geo_data.grid_size
+                            block_col = block_idx % geo_data.grid_size
+                            
+                            # Random location within block (in grid coordinates)
+                            x = block_col + np.random.uniform(0, 1)
+                            y = block_row + np.random.uniform(0, 1)
+                            
+                            # Convert to miles
+                            x_miles = x * geo_data.miles_per_grid_unit
+                            y_miles = y * geo_data.miles_per_grid_unit
+                            demand_points.append((x_miles, y_miles))
+                    
+                    if demand_points:
+                        # Calculate TSP routing cost for this dispatch
+                        tsp_length = calculate_simple_tsp_length(demand_points)
+                        district_travel += tsp_length
             
-            # User costs (wait time + travel time)
-            avg_wait_time = T_star / 2.0  # Average wait time
-            max_wait_time = max(max_wait_time, T_star)
+            district_travel_cost = district_travel / T_star
             
-            # Travel time cost (simplified)
-            avg_travel_time = 0.0
-            for block_id in assigned_blocks:
-                if daily_demands[block_id] > 0:
-                    dist_to_block = geo_data.get_dist(root_id, block_id)
-                    block_travel_time = dist_to_block / wv  # distance / speed
-                    avg_travel_time = max(avg_travel_time, block_travel_time)
-            max_travel_time = max(max_travel_time, avg_travel_time)
+            # Total provider cost
+            district_provider_cost = district_linehaul + district_odd + district_travel_cost
             
-            # Total user cost
-            wait_cost = avg_wait_time * district_demand * wr
-            travel_time_cost = avg_travel_time * district_demand * wr
-            user_cost = wait_cost + travel_time_cost
+            # User costs
+            district_wait = T_star
+            district_travel_time = (district_travel + min_depot_dist) / wv
+            district_user_cost = wr * (district_wait + district_travel_time)
             
-            # Provider cost
-            provider_cost = linehaul_cost + odd_cost + travel_cost
+            # Total district cost
+            district_total_cost = district_provider_cost + district_user_cost
             
-            district_total = provider_cost + user_cost
-            district_costs.append((root_id, provider_cost, user_cost, district_total, 
-                                 linehaul_cost, odd_cost, travel_cost))
+            district_costs.append((root_id, district_provider_cost, district_user_cost, 
+                                 district_total_cost, district_linehaul, district_odd, district_travel_cost))
+            
+            max_wait_time = max(max_wait_time, district_wait)
+            max_travel_time = max(max_travel_time, district_travel_time)
         
-        # Aggregate results
-        total_provider = sum(dc[1] for dc in district_costs)
-        total_user = sum(dc[2] for dc in district_costs)
-        total_cost = total_provider + total_user
+        # FIXED: Minimax objective - find worst district cost
+        if not district_costs:
+            total_cost = 0.0
+            provider_cost = 0.0
+            user_cost = 0.0
+        else:
+            # Find district with maximum total cost (minimax)
+            max_district = max(district_costs, key=lambda x: x[3])  # x[3] is total_cost
+            _, provider_cost, user_cost, total_cost, _, _, _ = max_district
         
         return SimulationResult(
             total_cost=total_cost,
-            user_cost=total_user,
-            provider_cost=total_provider,
+            user_cost=user_cost,
+            provider_cost=provider_cost,
             success=True
         )
         
     except Exception as e:
         print(f"    Simulation evaluation ({eval_type}) failed: {e}")
-        # Fallback: return design's original objective (better than inf)
         return SimulationResult(
             total_cost=design.obj_val,
             user_cost=design.obj_val * 0.6,
@@ -516,9 +641,10 @@ def run_sample_size_analysis(epsilon_0: float = 2.0,
     print(f"Trials per sample size: {num_trials}")
     print()
     
-    # Setup
+    # Setup with fixed 10×10 mile service region
+    service_region_miles = 10.0  # ALWAYS fixed at 10×10 miles
     n_blocks = grid_size * grid_size
-    geo_data = ToyGeoData(n_blocks, grid_size, service_region_miles=10.0)
+    geo_data = ToyGeoData(n_blocks, grid_size, service_region_miles=service_region_miles)
     Omega_dict, J_function = create_odd_features(grid_size)
     
     results = {
@@ -566,39 +692,77 @@ def run_sample_size_analysis(epsilon_0: float = 2.0,
             print(f"    Failed to compute worst-case distribution for n={n}")
             continue
         
-        # Step 4: Evaluate both designs on both distributions
-        print(f"    Evaluating designs via simulation...")
+        # Step 4: Evaluate both designs via MULTIPLE simulation trials
+        print(f"    Evaluating designs via simulation ({num_trials} trials each)...")
         
-        # Robust design evaluations
-        robust_nominal_result = evaluate_design_via_simulation(
-            geo_data, robust_design, nominal_prob_dict, "Robust on Nominal"
-        )
-        robust_worst_case_result = evaluate_design_via_simulation(
-            geo_data, robust_design, worst_case_prob_dict, "Robust on Worst-Case"
-        )
+        # Storage for trial results
+        robust_nominal_trials = []
+        robust_worst_case_trials = []
+        nominal_nominal_trials = []
+        nominal_worst_case_trials = []
         
-        # Nominal design evaluations
-        nominal_nominal_result = evaluate_design_via_simulation(
-            geo_data, nominal_design, nominal_prob_dict, "Nominal on Nominal"
-        )
-        nominal_worst_case_result = evaluate_design_via_simulation(
-            geo_data, nominal_design, worst_case_prob_dict, "Nominal on Worst-Case"
-        )
+        successful_trials = 0
         
-        # Store results
-        if (robust_nominal_result.success and robust_worst_case_result.success and 
-            nominal_nominal_result.success and nominal_worst_case_result.success):
+        for trial in range(num_trials):
+            trial_seed = 42 + n * 1000 + trial  # Unique seed per n and trial
+            
+            # Robust design evaluations
+            robust_nominal_result = evaluate_design_via_simulation(
+                geo_data, robust_design, nominal_prob_dict, "Robust on Nominal", trial_seed
+            )
+            robust_worst_case_result = evaluate_design_via_simulation(
+                geo_data, robust_design, worst_case_prob_dict, "Robust on Worst-Case", trial_seed
+            )
+            
+            # Nominal design evaluations  
+            nominal_nominal_result = evaluate_design_via_simulation(
+                geo_data, nominal_design, nominal_prob_dict, "Nominal on Nominal", trial_seed
+            )
+            nominal_worst_case_result = evaluate_design_via_simulation(
+                geo_data, nominal_design, worst_case_prob_dict, "Nominal on Worst-Case", trial_seed
+            )
+            
+            # Check if all simulations succeeded
+            if (robust_nominal_result.success and robust_worst_case_result.success and 
+                nominal_nominal_result.success and nominal_worst_case_result.success):
+                
+                robust_nominal_trials.append(robust_nominal_result.total_cost)
+                robust_worst_case_trials.append(robust_worst_case_result.total_cost)
+                nominal_nominal_trials.append(nominal_nominal_result.total_cost)
+                nominal_worst_case_trials.append(nominal_worst_case_result.total_cost)
+                successful_trials += 1
+        
+        # Store results if we have successful trials
+        if successful_trials > 0:
+            # Calculate means and standard deviations
+            robust_nominal_mean = np.mean(robust_nominal_trials)
+            robust_nominal_std = np.std(robust_nominal_trials) if len(robust_nominal_trials) > 1 else 0.0
+            
+            robust_worst_case_mean = np.mean(robust_worst_case_trials)
+            robust_worst_case_std = np.std(robust_worst_case_trials) if len(robust_worst_case_trials) > 1 else 0.0
+            
+            nominal_nominal_mean = np.mean(nominal_nominal_trials)
+            nominal_nominal_std = np.std(nominal_nominal_trials) if len(nominal_nominal_trials) > 1 else 0.0
+            
+            nominal_worst_case_mean = np.mean(nominal_worst_case_trials)
+            nominal_worst_case_std = np.std(nominal_worst_case_trials) if len(nominal_worst_case_trials) > 1 else 0.0
             
             results['sample_sizes'].append(n)
             results['epsilons'].append(epsilon)
-            results['robust_design_nominal_performance'].append(robust_nominal_result.total_cost)
-            results['robust_design_worst_case_performance'].append(robust_worst_case_result.total_cost)
-            results['nominal_design_nominal_performance'].append(nominal_nominal_result.total_cost)
-            results['nominal_design_worst_case_performance'].append(nominal_worst_case_result.total_cost)
+            results['robust_design_nominal_performance'].append(robust_nominal_mean)
+            results['robust_design_worst_case_performance'].append(robust_worst_case_mean)
+            results['nominal_design_nominal_performance'].append(nominal_nominal_mean)
+            results['nominal_design_worst_case_performance'].append(nominal_worst_case_mean)
             
-            print(f"    ✅ Results for n={n}:")
-            print(f"       Robust design:  {robust_nominal_result.total_cost:.1f} (nominal) | {robust_worst_case_result.total_cost:.1f} (worst-case)")
-            print(f"       Nominal design: {nominal_nominal_result.total_cost:.1f} (nominal) | {nominal_worst_case_result.total_cost:.1f} (worst-case)")
+            # Store standard deviations for error bars
+            results['robust_design_nominal_std'].append(robust_nominal_std)
+            results['robust_design_worst_case_std'].append(robust_worst_case_std)
+            results['nominal_design_nominal_std'].append(nominal_nominal_std)
+            results['nominal_design_worst_case_std'].append(nominal_worst_case_std)
+            
+            print(f"    ✅ Results for n={n} ({successful_trials}/{num_trials} successful trials):")
+            print(f"       Robust design:  {robust_nominal_mean:.1f}±{robust_nominal_std:.1f} (nominal) | {robust_worst_case_mean:.1f}±{robust_worst_case_std:.1f} (worst-case)")
+            print(f"       Nominal design: {nominal_nominal_mean:.1f}±{nominal_nominal_std:.1f} (nominal) | {nominal_worst_case_mean:.1f}±{nominal_worst_case_std:.1f} (worst-case)")
         else:
             print(f"    ❌ Failed to evaluate designs for n={n}")
     
@@ -690,20 +854,62 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
 def main():
     # Parse command line arguments
     epsilon_0 = 2.0
-    if len(sys.argv) > 1:
-        epsilon_0 = float(sys.argv[1])
+    grid_size = 5  # Default grid size
+    num_trials = 5  # Default number of simulation trials
+    
+    # Show usage help
+    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
+        print("Usage: python design_perf.py [epsilon_0] [grid_size] [num_trials]")
+        print("  epsilon_0:   Base Wasserstein radius (default: 2.0)")
+        print("  grid_size:   Grid resolution NxN (default: 5)")
+        print("  num_trials:  Number of simulation trials for error bars (default: 5)")
+        print("  ")
+        print("Examples:")
+        print("  python design_perf.py                    # Default: ε₀=2.0, 5×5 grid, 5 trials")
+        print("  python design_perf.py 1.5                # ε₀=1.5, 5×5 grid, 5 trials")  
+        print("  python design_perf.py 2.0 10             # ε₀=2.0, 10×10 grid, 5 trials")
+        print("  python design_perf.py 1.0 20 10          # ε₀=1.0, 20×20 grid, 10 trials")
+        print("  ")
+        print("Note: Service region is ALWAYS fixed at 10×10 miles")
+        return
+    
+    # Parse arguments: python design_perf.py [epsilon_0] [grid_size] [num_trials]
+    try:
+        if len(sys.argv) > 1:
+            epsilon_0 = float(sys.argv[1])
+        if len(sys.argv) > 2:
+            grid_size = int(sys.argv[2])
+        if len(sys.argv) > 3:
+            num_trials = int(sys.argv[3])
+    except ValueError:
+        print("Error: Invalid arguments. Use -h for help.")
+        return
+    
+    # Service region always fixed at 10×10 miles
+    service_region_miles = 10.0
+    block_size_miles = service_region_miles / grid_size
     
     print(f"Using ε₀ = {epsilon_0}")
+    print(f"Grid size: {grid_size}×{grid_size} = {grid_size**2} blocks")
+    print(f"Service region: {service_region_miles}×{service_region_miles} miles (FIXED)")
+    print(f"Block size: {block_size_miles:.3f}×{block_size_miles:.3f} miles")
+    print(f"Simulation trials: {num_trials} per design evaluation")
+    print()
     
-    # Run analysis with fewer sample sizes for testing trials
-    sample_sizes = [5, 10, 15, 20, 25, 30, 35, 40]
+    # Adjust sample sizes based on grid resolution
+    if grid_size <= 5:
+        sample_sizes = [5, 10, 15, 20, 25, 30, 35, 40]
+    elif grid_size <= 10:
+        sample_sizes = [10, 20, 30, 40, 50, 60, 80, 100]
+    else:
+        sample_sizes = [20, 40, 60, 80, 100, 120, 150, 200]
     
     results = run_sample_size_analysis(
         epsilon_0=epsilon_0,
-        grid_size=5,  # Use 5x5 grid for faster computation
+        grid_size=grid_size,
         num_districts=3,
         sample_sizes=sample_sizes,
-        num_trials=3  # Run 3 trials per sample size for error bars
+        num_trials=num_trials  # Use command line argument
     )
     
     if results['sample_sizes']:
