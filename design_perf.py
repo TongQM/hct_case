@@ -813,7 +813,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
     
     ax1.set_xlabel('Sample Size n', fontsize=14)
     ax1.set_ylabel('Total Cost (Objective Value)', fontsize=14)
-    ax1.set_title(f'Performance on Worst-Case Distribution\\n(Evaluation under adversarial demand, ε₀ = {epsilon_0})', fontsize=15)
+    # ax1.set_title(f'Performance on Worst-Case Distribution\\n(Evaluation under adversarial demand, ε₀ = {epsilon_0})', fontsize=15)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=12)
     ax1.tick_params(axis='both', which='major', labelsize=12)
@@ -841,7 +841,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
     
     ax2.set_xlabel('Sample Size n', fontsize=14)
     ax2.set_ylabel('Total Cost (Objective Value)', fontsize=14)
-    ax2.set_title(f'Performance on Nominal Distribution\\n(Evaluation under empirical demand, ε₀ = {epsilon_0})', fontsize=15)
+    # ax2.set_title(f'Performance on Nominal Distribution\\n(Evaluation under empirical demand, ε₀ = {epsilon_0})', fontsize=15)
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=12)
     ax2.tick_params(axis='both', which='major', labelsize=12)
@@ -850,6 +850,107 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
     plt.savefig('nominal_performance.pdf', dpi=300, bbox_inches='tight')
     plt.close(fig2)
     print("✅ Nominal performance plot saved as 'nominal_performance.pdf'")
+    
+    # Figure 3: Trade-off Scatter Plot (Nominal vs Worst-case Performance)
+    fig3, ax3 = plt.subplots(1, 1, figsize=(14, 10))
+    
+    # Define different shapes for different sample sizes
+    markers = ['o', 's', '^', 'D', 'v', 'p', '*', 'h']
+    marker_sizes = [8, 8, 9, 7, 9, 10, 12, 9]
+    
+    # Plot robust designs (red) and nominal designs (blue)
+    for i, n in enumerate(sample_sizes):
+        marker = markers[i % len(markers)]
+        size = marker_sizes[i % len(marker_sizes)]
+        
+        # Robust design (red)
+        robust_nominal_perf = robust_nominal[i]
+        robust_worst_case_perf = robust_worst_case[i]
+        
+        if use_error_bars:
+            ax3.errorbar(robust_nominal_perf, robust_worst_case_perf, 
+                        xerr=robust_nominal_std[i], yerr=robust_worst_case_std[i],
+                        fmt=marker, color='red', markersize=size, capsize=4, capthick=1.5, alpha=0.8,
+                        markerfacecolor='red', markeredgecolor='darkred', markeredgewidth=1)
+        else:
+            ax3.plot(robust_nominal_perf, robust_worst_case_perf, marker=marker, color='red', 
+                    markersize=size, alpha=0.8, markerfacecolor='red', markeredgecolor='darkred', 
+                    markeredgewidth=1, linestyle='None')
+        
+        # Nominal design (blue) 
+        nominal_nominal_perf = nominal_nominal[i]
+        nominal_worst_case_perf = nominal_worst_case[i]
+        
+        if use_error_bars:
+            ax3.errorbar(nominal_nominal_perf, nominal_worst_case_perf,
+                        xerr=nominal_nominal_std[i], yerr=nominal_worst_case_std[i],
+                        fmt=marker, color='blue', markersize=size, capsize=4, capthick=1.5, alpha=0.8,
+                        markerfacecolor='blue', markeredgecolor='darkblue', markeredgewidth=1)
+        else:
+            ax3.plot(nominal_nominal_perf, nominal_worst_case_perf, marker=marker, color='blue',
+                    markersize=size, alpha=0.8, markerfacecolor='blue', markeredgecolor='darkblue',
+                    markeredgewidth=1, linestyle='None')
+    
+    # Add diagonal reference line (y = x)
+    min_cost = min(min(robust_nominal), min(robust_worst_case), 
+                   min(nominal_nominal), min(nominal_worst_case))
+    max_cost = max(max(robust_nominal), max(robust_worst_case),
+                   max(nominal_nominal), max(nominal_worst_case))
+    ax3.plot([min_cost, max_cost], [min_cost, max_cost], 'k--', alpha=0.5, linewidth=1, 
+             label='y = x (Equal Performance)')
+    
+    # Formatting
+    ax3.set_xlabel('Nominal Performance (Cost under Empirical Distribution)', fontsize=14)
+    ax3.set_ylabel('Worst-Case Performance (Cost under Adversarial Distribution)', fontsize=14)
+    # ax3.set_title(f'Design Performance Trade-off\\n(Nominal vs Worst-Case Performance, ε₀ = {epsilon_0})', fontsize=15, fontweight='bold')
+    ax3.grid(True, alpha=0.3)
+    ax3.tick_params(axis='both', which='major', labelsize=12)
+    
+    # Create comprehensive legend
+    from matplotlib.lines import Line2D
+    
+    # Design type legend
+    design_legend = [
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='red', markersize=10,
+               markeredgecolor='darkred', markeredgewidth=1,
+               label='Robust Design (ε = ε₀/√n)', linestyle='None'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='blue', markersize=10,
+               markeredgecolor='darkblue', markeredgewidth=1,
+               label='Nominal Design (ε = 0)', linestyle='None'),
+        Line2D([0], [0], color='black', linestyle='--', alpha=0.5,
+               label='y = x (Equal Performance)')
+    ]
+    
+    # Sample size legend (show first 6 sample sizes with their shapes)
+    size_legend = []
+    for i, n in enumerate(sample_sizes[:6]):  # Show first 6 to avoid overcrowding
+        marker = markers[i % len(markers)]
+        size = marker_sizes[i % len(marker_sizes)]
+        size_legend.append(
+            Line2D([0], [0], marker=marker, color='w', markerfacecolor='gray', 
+                   markersize=size, markeredgecolor='black', markeredgewidth=1,
+                   label=f'n = {n}', linestyle='None')
+        )
+    
+    # Create two separate legends
+    legend1 = ax3.legend(handles=design_legend, loc='upper left', fontsize=12, 
+                        title='Design Type', title_fontsize=13)
+    ax3.add_artist(legend1)  # Keep first legend when adding second
+    
+    legend2 = ax3.legend(handles=size_legend, loc='lower right', fontsize=11,
+                        title='Sample Size', title_fontsize=12, ncol=2)
+    
+    # Add interpretation text (moved to center-left to avoid legend overlap)
+    # ax3.text(0.02, 0.65, 
+    #         'Points below diagonal:\\nBetter worst-case than nominal\\n\\n' +
+    #         'Points above diagonal:\\nWorse worst-case than nominal',
+    #         transform=ax3.transAxes, verticalalignment='top', fontsize=11,
+    #         bbox=dict(boxstyle='round,pad=0.5', facecolor='lightyellow', alpha=0.8))
+    
+    plt.tight_layout()
+    plt.savefig('performance_tradeoff.pdf', dpi=300, bbox_inches='tight')
+    plt.close(fig3)
+    print("✅ Performance trade-off plot saved as 'performance_tradeoff.pdf'")
 
 def main():
     # Parse command line arguments
