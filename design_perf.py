@@ -31,6 +31,16 @@ import time
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional
 from scipy.stats import beta, gamma, multivariate_normal
+from scipy.spatial.distance import pdist, squareform
+from scipy.sparse.csgraph import minimum_spanning_tree
+
+# Try to import python_tsp, fallback to MST if not available
+try:
+    from python_tsp.heuristics import solve_tsp_local_search, solve_tsp_simulated_annealing
+    from python_tsp.exact import solve_tsp_dynamic_programming
+    PYTHON_TSP_AVAILABLE = True
+except Exception:
+    PYTHON_TSP_AVAILABLE = False
 
 warnings.filterwarnings('ignore')
 
@@ -154,6 +164,15 @@ class ToyGeoData(GeoData):
     
     def get_K(self, block_id):
         return 2.0
+
+    def get_coord_in_miles(self, block_id: str) -> Tuple[float, float]:
+        """Return the center coordinate of a block in miles within the 10×10 region."""
+        idx = self.short_geoid_list.index(block_id)
+        row = idx // self.grid_size
+        col = idx % self.grid_size
+        x_miles = (col + 0.5) * self.miles_per_grid_unit
+        y_miles = (row + 0.5) * self.miles_per_grid_unit
+        return (x_miles, y_miles)
 
 def create_true_distribution_sampler(grid_size: int, seed: int = 42):
     """Create sampler for properly truncated mixed-Gaussian distribution"""
@@ -280,7 +299,7 @@ def optimize_service_design(geo_data: ToyGeoData,
         
         # Run Random Search optimization
         depot_id, district_roots, assignment, obj_val, district_info = partition.random_search(
-            max_iters=20,  # Same as simulate_service_designs.py
+            max_iters=30,  # Same as simulate_service_designs.py
             prob_dict=prob_dict,
             Lambda=100, wr=1.0, wv=10.0, beta=0.7120,
             Omega_dict=Omega_dict,
@@ -402,44 +421,42 @@ def sample_demand_points_in_district(geo_data, assigned_blocks, dispatch_demand,
     
     return points
 
-def calculate_simple_tsp_length(demand_points):
-    """Calculate TSP length using MST approximation for speed"""
-    if len(demand_points) <= 1:
+def calculate_tsp_length(points: List[Tuple[float, float]], use_exact: bool = True) -> float:
+    """Compute TSP tour length using python_tsp if available; fallback to MST.
+
+    - Exact DP for very small n, SA for medium n, local search for larger n.
+    - Fallback: 2 × MST length (conservative upper bound for metric TSP).
+    - Two-point case returns 2 × Euclidean distance (out-and-back).
+    """
+    if len(points) <= 1:
         return 0.0
-    
-    if len(demand_points) == 2:
-        p1, p2 = demand_points
-        return np.sqrt((p1[0] - p2[0])**2 + (p1[1] - p2[1])**2)
-    
-    # MST approximation: sum of all pairwise distances, take MST
-    points = np.array(demand_points)
-    n = len(points)
-    
-    # Simple MST using Prim's algorithm
-    in_mst = [False] * n
-    key = [float('inf')] * n
-    key[0] = 0.0
-    mst_weight = 0.0
-    
-    for _ in range(n):
-        # Find minimum key vertex not in MST
-        u = -1
-        for v in range(n):
-            if not in_mst[v] and (u == -1 or key[v] < key[u]):
-                u = v
-        
-        in_mst[u] = True
-        mst_weight += key[u]
-        
-        # Update key values of adjacent vertices
-        for v in range(n):
-            if not in_mst[v]:
-                dist = np.sqrt((points[u][0] - points[v][0])**2 + (points[u][1] - points[v][1])**2)
-                if dist < key[v]:
-                    key[v] = dist
-    
-    # TSP ≈ 1.5 × MST for random points
-    return mst_weight * 1.5
+
+    if len(points) == 2:
+        (x1, y1), (x2, y2) = points
+        return 2.0 * np.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+    coords = np.array(points)
+    dist_matrix = squareform(pdist(coords, 'euclidean'))
+
+    if use_exact and PYTHON_TSP_AVAILABLE:
+        try:
+            n = len(points)
+            if n <= 12:
+                _, distance = solve_tsp_dynamic_programming(dist_matrix)
+                return float(distance)
+            elif n <= 30:
+                _, distance = solve_tsp_simulated_annealing(dist_matrix, max_processing_time=2.0)
+                return float(distance)
+            else:
+                _, distance = solve_tsp_local_search(dist_matrix)
+                return float(distance)
+        except Exception:
+            pass  # Fall through to MST fallback
+
+    # MST fallback
+    mst = minimum_spanning_tree(dist_matrix)
+    mst_length = float(mst.sum())
+    return 2.0 * mst_length
 
 def evaluate_design_via_simulation(geo_data: ToyGeoData,
                                  design: DesignResult,
@@ -503,10 +520,10 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
             # Number of dispatches during service hours
             num_dispatches = max(1, int(np.ceil(SERVICE_HOURS / T_star)))
             
-            # FIXED: Proper linehaul cost = depot to district distance / T_star
-            min_depot_dist = min(geo_data.get_dist(design.depot_id, block_id) 
-                               for block_id in assigned_blocks)
-            district_linehaul = min_depot_dist / T_star
+            # FIXED: Proper linehaul cost = roundtrip depot–root distance amortized by T_star
+            root_depot_dist = geo_data.get_dist(design.depot_id, root_id)
+            total_linehaul = 2.0 * root_depot_dist
+            district_linehaul = total_linehaul / T_star
             
             # ODD cost: maximum ODD features in district (amortized over T_star)
             district_omega = np.zeros(2)
@@ -562,9 +579,13 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
                             y_miles = y * geo_data.miles_per_grid_unit
                             demand_points.append((x_miles, y_miles))
                     
-                    if demand_points:
-                        # Calculate TSP routing cost for this dispatch
-                        tsp_length = calculate_simple_tsp_length(demand_points)
+                    # Include the district root in the TSP tour
+                    rx, ry = geo_data.get_coord_in_miles(root_id)
+                    tsp_points = [(rx, ry)] + demand_points
+
+                    if tsp_points:
+                        # Calculate TSP routing cost for this dispatch (python_tsp with MST fallback)
+                        tsp_length = calculate_tsp_length(tsp_points, use_exact=True)
                         district_travel += tsp_length
             
             district_travel_cost = district_travel / T_star
@@ -574,7 +595,7 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
             
             # User costs
             district_wait = T_star
-            district_travel_time = (district_travel + min_depot_dist) / wv
+            district_travel_time = (district_travel + total_linehaul) / wv
             district_user_cost = wr * (district_wait + district_travel_time)
             
             # Total district cost

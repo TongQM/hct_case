@@ -470,7 +470,7 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
                               J_function: callable,
                               daily_demand_rate: float = 100.0,
                               wr: float = 1.0,  # Time-to-cost conversion factor
-                              wv: float = 10.0) -> SimulationResults:  # Vehicle speed (miles/minute)
+                              wv: float = 10.0) -> SimulationResults:  # Vehicle speed (miles/hour)
     """Simulate one day's operation of the service design using true distribution
     
     Service hours: 8am-8pm (12 hours total)
@@ -532,10 +532,9 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
         # === DISTRICT-LEVEL COSTS (for minimax objective) ===
         
         # Provider costs for this district
-        # 1. Linehaul cost: depot to closest block in district
-        min_depot_dist = min(geo_data.get_dist(service_design.depot_id, block_id) 
-                            for block_id in assigned_blocks)
-        total_linehaul = min_depot_dist
+        # 1. Linehaul cost: roundtrip between depot and district root, amortized by T_star
+        root_depot_dist = geo_data.get_dist(service_design.depot_id, root_id)
+        total_linehaul = 2.0 * root_depot_dist
         district_linehaul = total_linehaul / T_star
         
         # 2. ODD cost: based on district maximum ODD features
@@ -543,9 +542,10 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
         for block_id in assigned_blocks:
             if block_id in Omega_dict:
                 district_omega = np.maximum(district_omega, Omega_dict[block_id])
-        
-        total_odd_cost = J_function(district_omega) * num_dispatches
-        district_odd = total_odd_cost / T_star
+        # ODD scales with number of vehicles, not number of dispatches.
+        # Since T_star is the dispatch subinterval per vehicle (dispatch interval / num_vehicles),
+        # amortizing by T_star already accounts for fleet size. Do not multiply by num_dispatches.
+        district_odd = J_function(district_omega) / T_star
         
         # 3. Travel cost: TSP-based routing with Poisson demand arrivals
         district_travel = 0.0
@@ -571,9 +571,13 @@ def simulate_one_day_operation(geo_data: ToyGeoData,
                     geo_data, assigned_blocks, dispatch_demand, dispatch_sampler
                 )
                 
-                if demand_points:
+                # Include the district root in the TSP tour
+                rx, ry = geo_data.get_coord_in_miles(root_id)
+                tsp_points = [(rx, ry)] + demand_points
+                
+                if tsp_points:
                     # Use enhanced TSP calculation
-                    tsp_length = calculate_tsp_length(demand_points, use_exact=True)
+                    tsp_length = calculate_tsp_length(tsp_points, use_exact=True)
                     district_travel += tsp_length
                     
                     # Debug: show Poisson variance and TSP method
