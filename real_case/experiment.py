@@ -23,6 +23,7 @@ from real_case.inputs import (
     load_probability_from_population,
     load_real_odd,
     load_baseline_assignment,
+    set_geodata_speeds,
 )
 from lib.algorithm import Partition
 from lib.data import RouteData
@@ -176,12 +177,13 @@ def _evaluate_tsp_partition(
 
     - Rider metrics: mean wait per rider (T/2), mean transit per rider based on evaluate's
       mean_transit_distance_per_interval divided by expected riders per interval and wv.
-    - Provider metrics: linehaul (2*dist(depot,root)/T), ODD (J(max Omega in district)/T),
-      travel (use evaluate's amt_transit_distance converted to time via wv).
+    - Provider metrics: linehaul distance rate (2*dist(depot,root)/T) [km/h],
+      ODD (J(max Omega in district)/T), travel distance rate (amt_transit_distance) [km/h].
     Returns dict with 'per_district' and 'aggregate' for expected vs worst-P.
     """
     # Constants for conversion
-    wv = getattr(geodata, 'wv', 10.0)   # mph for vehicle
+    # Use km/h consistently
+    wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 10.0) * 1.60934)
     # build evaluator only if needed
     rd = RouteData('hct_routes.json', geodata)
     ev = Evaluate(rd, geodata)
@@ -215,26 +217,28 @@ def _evaluate_tsp_partition(
         if override_T_by_partition and root in override_T_by_partition:
             T = float(override_T_by_partition[root])
 
-        # Rider: wait per rider
-        wait_per_rider = T / 2.0
+        # Rider: wait per rider (hours)
+        wait_per_rider_h = T / 2.0
 
-        # Rider: transit per rider = (total transit distance per interval) / (expected riders per interval) / wv
-        dist_interval = float(dres['mean_transit_distance_per_interval'])  # miles per interval (aggregate)
+        # Rider: transit per rider (hours)
+        #  - service leg: (km per interval) / (riders per interval) / (km/h)
+        dist_interval = float(dres['mean_transit_distance_per_interval'])  # km per interval (aggregate)
         district_mass = mass_by_root.get(root, 0.0)
         riders_per_interval = overall_arrival_rate * district_mass * T
         if riders_per_interval > 0:
-            transit_time_per_rider = (dist_interval / riders_per_interval) / (wv / 60.0)  # minutes
+            transit_time_per_rider_h = (dist_interval / riders_per_interval) / (wv)
         else:
-            transit_time_per_rider = 0.0
+            transit_time_per_rider_h = 0.0
 
-        # Provider: linehaul + ODD + travel (convert to minutes per hour)
+        # Provider: linehaul + ODD + travel
         #  - linehaul: use shortest depot→district distance, robust to whether roots have been relocated
         assigned_blocks = _district_blocks(assignment, block_ids, root)
         if assigned_blocks:
-            dr_min = min(geodata.get_dist(depot_id, b) for b in assigned_blocks)
+            dr_min = min(geodata.get_dist(depot_id, b) for b in assigned_blocks)  # km
         else:
-            dr_min = geodata.get_dist(depot_id, root)
-        linehaul_min_per_hour = (2.0 * dr_min / T) / (wv / 60.0)
+            dr_min = geodata.get_dist(depot_id, root)  # km
+        # Distance rate (km/h) for linehaul over time: 2*distance per cycle divided by interval length T
+        linehaul_kmph = (2.0 * dr_min) / T
 
         #  - ODD cost: J(max Omega in district)/T treated as minutes proxy (already a scalar). Keep as is.
         omega_vec = np.zeros(2)
@@ -245,36 +249,39 @@ def _evaluate_tsp_partition(
                 omega_vec = np.maximum(omega_vec, ov)
         odd_cost = float(J_function(omega_vec)) / T
 
-        #  - travel: amt_transit_distance is miles per hour; convert to minutes by vehicle speed
-        amt_transit_distance = float(dres['amt_transit_distance'])  # miles per hour
-        travel_min_per_hour = (amt_transit_distance) / (wv / 60.0)
+        #  - travel: amt_transit_distance is already km per hour
+        amt_transit_distance = float(dres['amt_transit_distance'])  # km per hour
+        travel_kmph = amt_transit_distance
+
+        #  - on-board linehaul leg per rider: half of the linehaul time (outbound)
+        transit_time_per_rider_h += (dr_min / wv)
 
         per_district[root] = {
             'dispatch_interval_h': T,
-            'rider_wait_min': wait_per_rider * 60.0,  # T is hours; convert to minutes
-            'rider_transit_min': transit_time_per_rider,      # already minutes
-            'provider_linehaul_min': linehaul_min_per_hour,
+            'rider_wait_h': wait_per_rider_h,
+            'rider_transit_h': transit_time_per_rider_h,
+            'provider_linehaul_kmph': linehaul_kmph,
             'provider_odd_cost': odd_cost,
-            'provider_travel_min': travel_min_per_hour,
+            'provider_travel_kmph': travel_kmph,
             'mass': district_mass,
         }
 
     # Aggregate by mass (riders) and sum provider components
     tot_mass = sum(per_district[r]['mass'] for r in center_list) or 1.0
-    rider_wait = sum(per_district[r]['rider_wait_min'] * per_district[r]['mass'] for r in center_list) / tot_mass
-    rider_transit = sum(per_district[r]['rider_transit_min'] * per_district[r]['mass'] for r in center_list) / tot_mass
-    provider_linehaul = sum(per_district[r]['provider_linehaul_min'] for r in center_list)
+    rider_wait = sum(per_district[r]['rider_wait_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
+    rider_transit = sum(per_district[r]['rider_transit_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
+    provider_linehaul = sum(per_district[r]['provider_linehaul_kmph'] for r in center_list)
     provider_odd = sum(per_district[r]['provider_odd_cost'] for r in center_list)
-    provider_travel = sum(per_district[r]['provider_travel_min'] for r in center_list)
+    provider_travel = sum(per_district[r]['provider_travel_kmph'] for r in center_list)
 
     return {
         'per_district': per_district,
         'aggregate': {
-            'rider_wait_min': rider_wait,
-            'rider_transit_min': rider_transit,
-            'provider_linehaul_min': provider_linehaul,
+            'rider_wait_h': rider_wait,
+            'rider_transit_h': rider_transit,
+            'provider_linehaul_kmph': provider_linehaul,
             'provider_odd_cost': provider_odd,
-            'provider_travel_min': provider_travel,
+            'provider_travel_kmph': provider_travel,
         }
     }
 
@@ -282,6 +289,8 @@ def _evaluate_tsp_partition(
 def run(method: str, num_districts: int, visualize_baseline: bool = False, max_iters: int = 200,
         overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5):
     geodata = load_geodata()
+    # Set speeds (mph) from routes and walking baseline
+    wv_kmh, wr_kmh = set_geodata_speeds(geodata, 'hct_routes.json', walk_kmh=5.0)
     prob = load_probability_from_population(geodata)
     Omega = load_real_odd()
 
@@ -369,8 +378,20 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     # Compute depot for baseline partition
     base_depot = part.optimize_depot_location(base_assign, base_roots, prob)
 
-    # Compute realistic T* for baseline partition using the same objective as optimization
-    # This avoids degenerate tiny dispatch intervals in baseline TSP evaluation
+    # 2) TSP under original partition (unconstrained and constrained)
+    #    Relocate baseline roots to be depot-closest so dist(depot, root) equals the
+    #    shortest distance to the district, per modeling requirement.
+    try:
+        base_assign, base_roots = part.relocate_roots_to_depot_closest(base_assign, base_depot)
+    except Exception:
+        pass
+    # Relocate baseline roots to be depot-closest to align root IDs and distances
+    try:
+        base_assign, base_roots = part.relocate_roots_to_depot_closest(base_assign, base_depot)
+    except Exception:
+        pass
+
+    # Compute realistic T* for baseline partition AFTER relocation so root IDs match
     try:
         _obj_base, _district_info_base = part.evaluate_partition_objective(
             base_assign, base_depot, prob,
@@ -381,13 +402,6 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     except Exception:
         T_override_base = None
 
-    # 2) TSP under original partition (unconstrained and constrained)
-    #    Relocate baseline roots to be depot-closest so dist(depot, root) equals the
-    #    shortest distance to the district, per modeling requirement.
-    try:
-        base_assign, base_roots = part.relocate_roots_to_depot_closest(base_assign, base_depot)
-    except Exception:
-        pass
     tsp_base_unconstrained = _evaluate_tsp_partition(
         geodata, base_assign, base_roots, prob, Omega, base_depot,
         overall_arrival_rate=overall_arrival_rate,
@@ -447,31 +461,36 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     }
     print(json.dumps(summary, indent=2))
 
-    os.makedirs('lbbd_results', exist_ok=True)
+    os.makedirs('results', exist_ok=True)
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-    summary_path = os.path.join('lbbd_results', f'real_case_summary_{ts}.json')
+    summary_path = os.path.join('results', f'real_case_summary_{ts}.json')
     with open(summary_path, 'w') as f:
         json.dump(summary, f, indent=2)
 
     # Also emit a compact CSV-like table for quick comparison
     table_lines = []
-    table_lines.append('Design,Perspective,Metric,WorstP,Expected,ProviderWorst,ProviderExpected')
+    table_lines.append('Design,Perspective,Metric,WorstP_h,Expected_h,ProviderWorst_kmph,ProviderExpected_kmph')
     # FR
     fr_r = fr_eval['rider']
     fr_p = fr_eval['provider']
-    table_lines.append(f"P0 FR,Rider,walk,{fr_r['worstP']['walk_s']},{fr_r['expected']['walk_s']},,")
-    table_lines.append(f"P0 FR,Rider,wait,,{fr_r['expected']['wait_s']},,")
-    table_lines.append(f"P0 FR,Rider,transit,,{fr_r['expected']['transit_s']},,")
+    # Convert FR rider seconds to hours
+    fr_walk_worstP_h = (fr_r['worstP']['walk_s'] or 0.0) / 3600.0
+    fr_walk_exp_h = (fr_r['expected']['walk_s'] or 0.0) / 3600.0
+    fr_wait_exp_h = (fr_r['expected']['wait_s'] or 0.0) / 3600.0
+    fr_transit_exp_h = (fr_r['expected']['transit_s'] or 0.0) / 3600.0
+    table_lines.append(f"P0 FR,Rider,walk,{fr_walk_worstP_h},{fr_walk_exp_h},,")
+    table_lines.append(f"P0 FR,Rider,wait,,{fr_wait_exp_h},,")
+    table_lines.append(f"P0 FR,Rider,transit,,{fr_transit_exp_h},,")
     # TSP original
     for tag, res in [('P0 TSP unconstrained', tsp_base_unconstrained), ('P0 TSP constrained', tsp_base_constrained)]:
         agg = res['aggregate']
-        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_min']},,{agg['provider_linehaul_min']+agg['provider_travel_min']},{agg['provider_linehaul_min']+agg['provider_travel_min']}")
-        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_min']},,,")
+        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_h']},,{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']},{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_h']},,,")
     # TSP optimal
     for tag, res in [('P* TSP unconstrained', tsp_opt_unconstrained), ('P* TSP constrained', tsp_opt_constrained)]:
         agg = res['aggregate']
-        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_min']},,{agg['provider_linehaul_min']+agg['provider_travel_min']},{agg['provider_linehaul_min']+agg['provider_travel_min']}")
-        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_min']},,,")
+        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_h']},,{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']},{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_h']},,,")
 
     table_path = os.path.join('lbbd_results', f'real_case_table_{ts}.csv')
     with open(table_path, 'w') as f:

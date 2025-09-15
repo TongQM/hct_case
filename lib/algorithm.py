@@ -418,7 +418,10 @@ class Partition:
         # Wasserstein constraint: sum_{j,l} d_jl * y_jl <= epsilon
         model.addConstr(gp.quicksum(cost_matrix[j, l] * y[j, l] for j in range(N) for l in range(N)) <= epsilon, name='wasserstein')
         
+        # Keep solves bounded for interactive runs
         model.setParam('OutputFlag', 0)
+        # model.setParam('TimeLimit', 10)
+        # model.setParam('Threads', 1)
         model.optimize()
         
         if model.status != gp.GRB.OPTIMAL:
@@ -441,9 +444,15 @@ class Partition:
         # Apply BHH coefficient: α_i = β * √Λ * raw_alpha
         alpha_i = beta * np.sqrt(Lambda) * raw_alpha
         
-        # Use the partition-dependent costs K_i and F_i from master problem
-        wr = getattr(self.geodata, 'wr', 1.0)
-        wv = getattr(self.geodata, 'wv', 10.0)
+        # Use speeds consistent with distance units (km). Prefer km/h if available.
+        wr = getattr(self.geodata, 'wr_kmh', None)
+        wv = getattr(self.geodata, 'wv_kmh', None)
+        if wr is None or wv is None:
+            # Fallback: convert mph to km/h if only mph provided
+            wr_mph = getattr(self.geodata, 'wr', 1.0)
+            wv_mph = getattr(self.geodata, 'wv', 10.0)
+            wr = wr_mph * 1.60934
+            wv = wv_mph * 1.60934
         
         # Newton's method for optimal ci (dispatch subinterval)
         # g_bar is strictly convex, so we can find the exact optimum analytically

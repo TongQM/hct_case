@@ -24,6 +24,59 @@ def load_geodata() -> GeoData:
     return GeoData(shp, BG_GEOID_LIST, level='block_group')
 
 
+def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'hct_routes.json') -> float:
+    """Estimate vehicle speed in km/h from HCT routes.
+
+    For each route, decode the polyline, project to EPSG:2163 using RouteData's
+    projector, compute total path length (kilometers) and divide by total
+    scheduled time (hours) from SecondsToNextStop. Return the median km/h across routes.
+    """
+    try:
+        rd = RouteData(routes_json, geodata)
+        import polyline
+        from shapely.geometry import LineString
+
+        kmh_values = []
+        for route in rd.routes_info:
+            poly = route.get('EncodedPolyline')
+            stops = route.get('Stops', [])
+            total_secs = sum(s.get('SecondsToNextStop', 0) for s in stops)
+            if not poly or total_secs <= 0:
+                continue
+            try:
+                coords = polyline.decode(poly)  # list of (lat, lon)
+                line = LineString([(lng, lat) for (lat, lng) in coords])
+                proj_line = rd.project_geometry(line)  # EPSG:2163 meters
+                km = float(proj_line.length) / 1000.0
+                hours = float(total_secs) / 3600.0
+                kmh = km / hours if hours > 0 else None
+                if kmh and kmh > 0:
+                    kmh_values.append(kmh)
+            except Exception:
+                continue
+        if kmh_values:
+            import statistics
+            return float(statistics.median(kmh_values))
+    except Exception:
+        pass
+    # Fallback if routes not available
+    return 20.0  # km/h fallback
+
+
+def set_geodata_speeds(geodata: GeoData, routes_json: str = 'hct_routes.json', walk_kmh: float = 5.0) -> tuple[float, float]:
+    """Set speeds on geodata consistently in km/h and return (wv_kmh, wr_kmh).
+
+    Defaults: walking 5.0 km/h (~1.39 m/s).
+    """
+    wv_kmh = compute_vehicle_speed_kmh(geodata, routes_json)
+    geodata.wv_kmh = wv_kmh
+    geodata.wr_kmh = walk_kmh
+    # Also store mph for any legacy code paths
+    geodata.wv = wv_kmh / 1.60934
+    geodata.wr = walk_kmh / 1.60934
+    return wv_kmh, walk_kmh
+
+
 def _load_population_df() -> pd.DataFrame:
     # Prefer configured B01003 CSV; fallback to provided aggregate
     path = DATA_PATHS.get('population_data')
@@ -67,4 +120,3 @@ def load_baseline_assignment(geodata: GeoData, routes_json: str = 'hct_routes.js
     # Convert centers (which are short_GEOID values) to strings for consistency
     centers = [str(c) for c in centers]
     return assignment, centers
-

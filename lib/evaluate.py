@@ -94,6 +94,8 @@ class Evaluate:
                                     for node1 in node_list for node2 in node_list) <= self.epsilon, "wasserstein_distance")
         
         model.setParam('OutputFlag', 0)
+        model.setParam('TimeLimit', 10)
+        model.setParam('Threads', 1)
         model.optimize()
 
         if model.status == GRB.OPTIMAL:
@@ -450,6 +452,8 @@ class Evaluate:
             model.addConstr(gp.quicksum(self.geodata.get_dist(node1, node2) * y[node1, node2] for node1 in node_list for node2 in node_list) <= self.epsilon, name='wasserstein')
             # Optimize model
             model.setParam('OutputFlag', 0)
+            model.setParam('TimeLimit', 10)
+            model.setParam('Threads', 1)
             model.optimize()
 
 
