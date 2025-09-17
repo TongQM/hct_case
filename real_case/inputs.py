@@ -63,18 +63,30 @@ def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'hct_routes.j
     return 20.0  # km/h fallback
 
 
-def set_geodata_speeds(geodata: GeoData, routes_json: str = 'hct_routes.json', walk_kmh: float = 5.0) -> tuple[float, float]:
-    """Set speeds on geodata consistently in km/h and return (wv_kmh, wr_kmh).
+def set_geodata_speeds(
+    geodata: GeoData,
+    routes_json: str = 'hct_routes.json',
+    walk_kmh: float = 5.04,
+    vehicle_kmh: float = 18.710765208297367,
+    compute_from_routes: bool = False,
+) -> tuple[float, float]:
+    """Set speeds on geodata in km/h and return (wv_kmh, wr_kmh).
 
-    Defaults: walking 5.0 km/h (~1.39 m/s).
+    Defaults align with the notebook and common practice:
+    - walk_kmh = 5.04 km/h (exactly 1.40 m/s)
+    - vehicle_kmh = 18.710765208297367 km/h (median service speed used in analyses)
+
+    If compute_from_routes=True, vehicle speed is recomputed from routes instead
+    of using the constant default.
     """
-    wv_kmh = compute_vehicle_speed_kmh(geodata, routes_json)
-    geodata.wv_kmh = wv_kmh
+    if compute_from_routes:
+        vehicle_kmh = compute_vehicle_speed_kmh(geodata, routes_json)
+    geodata.wv_kmh = vehicle_kmh
     geodata.wr_kmh = walk_kmh
     # Also store mph for any legacy code paths
-    geodata.wv = wv_kmh / 1.60934
+    geodata.wv = vehicle_kmh / 1.60934
     geodata.wr = walk_kmh / 1.60934
-    return wv_kmh, walk_kmh
+    return vehicle_kmh, walk_kmh
 
 
 def _load_population_df() -> pd.DataFrame:

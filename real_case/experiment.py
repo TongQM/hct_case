@@ -472,8 +472,15 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5, epsilon_km_arg: float | None = None,
         demand_source: str = 'population'):
     geodata = load_geodata()
-    # Set speeds (mph) from routes and walking baseline
-    wv_kmh, wr_kmh = set_geodata_speeds(geodata, 'hct_routes.json', walk_kmh=5.0)
+    # Set speeds (km/h). Defaults: wr=5.04 km/h (1.4 m/s), wv=18.7108 km/h.
+    # Use constants by default to match notebook; toggle compute_from_routes=True to recompute.
+    wv_kmh, wr_kmh = set_geodata_speeds(
+        geodata,
+        'hct_routes.json',
+        walk_kmh=5.04,
+        vehicle_kmh=18.710765208297367,
+        compute_from_routes=False,
+    )
     # Nominal distribution: match notebook if requested
     if str(demand_source).lower().startswith('commut'):
         prob = load_probability_from_commuting(geodata)
