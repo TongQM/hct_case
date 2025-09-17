@@ -23,17 +23,17 @@ For TSP mode, the costs on the riders include
     2) Transit time, expected transit time from home to the destination on the shuttle
 
 For the provider, the cost is
-    1) Travel cost, the long-run average cost of the shuttle operting on a district
-
-Besides the costs on the riders and the provider, we also want to capture the ridership based on the service and region design.
+    1) Travel cost, the long-run amortized travel distance of the shuttle including in-district travel and linehaul travel
 
 We will compare the different costs for different service designs.
 
     1) Original partition with fixed-route mode
+    2) Original partition with TSP mode
     2) Optimal partition with TSP mode
-    3) Optimal partition with TSP mode with max clearing interval constraints
+    3) Optimal partition with TSP mode with max clearing interval constraints (optional)
 '''
 
+BETA = 0.7120 # BHH coefficient
 
 class Evaluate:
 
@@ -109,7 +109,7 @@ class Evaluate:
 
     def find_worst_walk_node(self, dest_name='Walmart (Garden Center)'):
         """
-        Identify the node with the maximal walk distance to its nearest stop,
+        Identify the node (block/block group) with the maximal walk distance to its nearest stop,
         and compute its expected wait (headway/2) and transit time to the destination.
 
         Returns:
@@ -433,7 +433,9 @@ class Evaluate:
         probability_dict_dict = {}
 
         for center in center_list:
-            district_idx = center_list.index(center)
+            # node_assignment is N x N ordered by self.short_geoid_list for columns.
+            # Use the column index in the full block-id list, not the compact center_list index.
+            district_idx = self.short_geoid_list.index(center)
 
             model = gp.Model("inner_problem_lower_bound")
             # Add variables
@@ -468,7 +470,7 @@ class Evaluate:
 
         return probability_dict_dict
 
-    def evaluate_tsp_mode_on_single_district(self, prob_dict, node_assignment, center_list, center, unit_wait_cost=1.0, overall_arrival_rate=1000, max_dipatch_interval=24):
+    def evaluate_tsp_mode_on_single_district(self, prob_dict, node_assignment, center_list, center, unit_wait_cost=1.0, overall_arrival_rate=1000, max_dipatch_interval=24, fixed_T=None):
         """
         Evaluate the costs incurred by riders and the provider using TSP mode on a single district
         with its corresponding worst-case distribution dict.
@@ -483,7 +485,8 @@ class Evaluate:
         """
         node_list = self.short_geoid_list
         n = len(node_list)
-        district_idx = center_list.index(center)
+        # node_assignment is N x N ordered by self.short_geoid_list; select the correct column
+        district_idx = self.short_geoid_list.index(center)
 
         # Integrate the probability mass on the district
         district_prob = np.sum([prob_dict[node_list[i]] * node_assignment[i, district_idx] for i in range(n)])
@@ -491,34 +494,37 @@ class Evaluate:
         # Integrate the square root of the probability mass on the district, we use the vanilla implementation which can be optimized via
         # the optimal objective value obatined from get_tsp_worst_distributions
         district_prob_sqrt = np.sum([math.sqrt(prob_dict[node_list[i]]) * math.sqrt(self.geodata.get_area(node_list[i])) * node_assignment[i, district_idx] for i in range(n)])
-        # Get the optimal dispatch interval using 1-D minimization as in Partition._CQCP_benders
-        Tmin = 1e-3
-        Tmax = max_dipatch_interval  # Use argument as the upper bound for search
-        grid_points = 20
-        best_T = Tmin
-        best_obj = float('inf')
-        # For legacy compatibility, set K_i and F_i to 0 (or use actual values if available)
-        try:
-            K_i = float(self.geodata.get_K(center))
-        except Exception:
-            K_i = 0.0
-        try:
-            F_i = float(self.geodata.get_F(center))
-        except Exception:
-            F_i = 0.0
-        wr = getattr(self.geodata, 'wr', 1.0)
-        wv = getattr(self.geodata, 'wv', 10.0)
-        alpha_i = district_prob_sqrt  # for compatibility with Partition convention
-        for T in np.linspace(Tmin, Tmax, grid_points):
-            ci = np.sqrt(T)
-            g_bar = (K_i+F_i)*ci**-2 + alpha_i*ci**-1 + wr/(2*wv)*K_i + wr/wv*alpha_i*ci + wr*ci**2
-            if g_bar < best_obj:
-                best_obj = g_bar
-                best_T = T
-        interval = best_T
+        # Get the dispatch interval. If fixed_T is provided, use it; otherwise use 1-D search.
+        if fixed_T is not None:
+            interval = float(fixed_T)
+        else:
+            Tmin = 1e-3
+            Tmax = max_dipatch_interval  # Use argument as the upper bound for search
+            grid_points = 20
+            best_T = Tmin
+            best_obj = float('inf')
+            # For legacy compatibility, set K_i and F_i to 0 (or use actual values if available)
+            try:
+                K_i = float(self.geodata.get_K(center))
+            except Exception:
+                K_i = 0.0
+            try:
+                F_i = float(self.geodata.get_F(center))
+            except Exception:
+                F_i = 0.0
+            wr = getattr(self.geodata, 'wr', 1.0)
+            wv = getattr(self.geodata, 'wv', 10.0)
+            alpha_i = district_prob_sqrt  # for compatibility with Partition convention
+            for T in np.linspace(Tmin, Tmax, grid_points):
+                ci = np.sqrt(T)
+                g_bar = (K_i+F_i)*ci**-2 + alpha_i*ci**-1 + wr/(2*wv)*K_i + wr/wv*alpha_i*ci + wr*ci**2
+                if g_bar < best_obj:
+                    best_obj = g_bar
+                    best_T = T
+            interval = best_T
 
         mean_wait_time_per_interval_per_rider = interval / 2
-        mean_transit_distance_per_interval = 2287 / (math.sqrt(214) * 210) * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
+        mean_transit_distance_per_interval = BETA * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
 
         # amt_wait_time = mean_wait_time_per_interval_per_rider / interval
         amt_transit_distance = mean_transit_distance_per_interval / interval
@@ -535,7 +541,7 @@ class Evaluate:
 
         return results_dict
 
-    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list, unit_wait_cost=1.0, overall_arrival_rate=1000, worst_case=True, max_dipatch_interval=24):
+    def evaluate_tsp_mode(self, prob_dict, node_assignment, center_list, unit_wait_cost=1.0, overall_arrival_rate=1000, worst_case=True, max_dipatch_interval=24, fixed_T_by_district=None):
         """
         Evaluate the costs incurred by riders and the provider using TSP mode.
         For riders, the costs include
@@ -555,7 +561,14 @@ class Evaluate:
                 # Get the worst-case distribution for TSP mode
                 prob_dict = worst_probability_dict_dict[center]
             # Evaluate the costs incurred by riders and the provider using TSP mode
-            results_dict[center] = self.evaluate_tsp_mode_on_single_district(prob_dict, node_assignment, center_list, center, unit_wait_cost, overall_arrival_rate, max_dipatch_interval)
+            fixed_T = None
+            if fixed_T_by_district is not None and center in fixed_T_by_district:
+                fixed_T = fixed_T_by_district[center]
+            results_dict[center] = self.evaluate_tsp_mode_on_single_district(
+                prob_dict, node_assignment, center_list, center,
+                unit_wait_cost, overall_arrival_rate, max_dipatch_interval,
+                fixed_T=fixed_T
+            )
 
         return results_dict
 

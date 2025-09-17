@@ -28,6 +28,11 @@ from real_case.inputs import (
 from lib.algorithm import Partition
 from lib.data import RouteData
 from lib.evaluate import Evaluate
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from shapely.geometry import LineString
+import polyline
+import os
 
 
 def J_function(omega):
@@ -94,13 +99,21 @@ def evaluate_design(partition: Partition, assignment: np.ndarray, prob_dict, Ome
     }
 
 
-def _evaluate_fixed_route_full(geodata, prob: Dict[str, float]) -> Dict:
+def _avg_block_diameter_km(geodata) -> float:
+    """Approximate average block-group diameter in km using equal-area circle: d=2*sqrt(A/pi)."""
+    import math
+    areas_km2 = geodata.gdf.loc[geodata.short_geoid_list, 'area'].astype(float)  # km^2
+    diam_km = 2.0 * (areas_km2.apply(lambda a: math.sqrt(a / math.pi)))
+    return float(diam_km.mean()) if len(diam_km) else 0.1
+
+
+def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: float) -> Dict:
     """Evaluate Fixed-Route (FR) rider metrics using nearest stops and SimPy wait/transit simulation.
     Provider metrics are left as None (route operations treated as sunk in this framework).
     Returns a dict with expected and worst-P rider metrics.
     """
     rd = RouteData('hct_routes.json', geodata)
-    ev = Evaluate(rd, geodata)
+    ev = Evaluate(rd, geodata, epsilon=epsilon_km)
 
     # Nearest stop per node for walk times
     nearest = rd.find_nearest_stops()
@@ -136,26 +149,120 @@ def _evaluate_fixed_route_full(geodata, prob: Dict[str, float]) -> Dict:
         expected_wait_time = None
         expected_transit_time = None
 
-    return {
-        'rider': {
-            'expected': {
-                'walk_s': expected_walk_time,
-                'wait_s': expected_wait_time,
-                'transit_s': expected_transit_time,
-            },
-            'worstP': {
-                'walk_s': worstP_walk_time,
-                'wait_s': expected_wait_time,   # sunk for FR
-                'transit_s': expected_transit_time,  # sunk for FR
-            },
-            'worst_rider': {
-                'walk_s': max_walk_time,
-            }
+    # Provider metrics for Fixed-Route (FR)
+    # Treat linehaul as 0 (no depot shuttling) and compute an aggregate travel rate
+    # from total route distance over total cycle time across routes.
+    # Use Evaluate to gather route lengths and travel times without simulation side-effects.
+    try:
+        fr_eval_basic = ev.evaluate_fixed_route(prob_dict=prob, simulate=False)
+        # route_lengths are in projected meters (EPSG:2163), travel_times in seconds
+        total_length_m = sum(float(v) for v in fr_eval_basic.get('route_lengths', {}).values())
+        total_secs = sum(float(v) for v in fr_eval_basic.get('travel_times', {}).values())
+        total_km = total_length_m / 1000.0
+        total_h = total_secs / 3600.0 if total_secs > 0 else 0.0
+        provider_travel_kmph = (total_km / total_h) if total_h > 0 else 0.0
+    except Exception:
+        provider_travel_kmph = None
+
+    provider_dict = {
+        'expected': {
+            'linehaul_kmph': 0.0 if provider_travel_kmph is not None else None,
+            'travel_kmph': provider_travel_kmph,
+            'odd_cost': 0.0 if provider_travel_kmph is not None else None,
         },
-        'provider': {
-            'expected': None,
-            'worst': None,
+        'worst': {
+            'linehaul_kmph': 0.0 if provider_travel_kmph is not None else None,
+            'travel_kmph': provider_travel_kmph,
+            'odd_cost': 0.0 if provider_travel_kmph is not None else None,
         }
+    }
+
+    # Worst-user wait/transit for FR using route headways and stop-to-destination times
+    try:
+        # route headways
+        route_headways = {}
+        for route in rd.routes_info:
+            name = route.get('Description', f"Route {route.get('RouteID')}")
+            secs = [s.get('SecondsToNextStop', 0) for s in route.get('Stops', [])]
+            route_headways[name] = sum(secs)
+        worst_user_wait_time = max(route_headways.values()) if route_headways else None
+        # max transit to destination over nodes
+        dest_name = 'Walmart (Garden Center)'
+        worst_user_transit_time = 0.0
+        for n in nodes:
+            info = nearest[n]
+            rname = info['route']
+            bstop = info['stop']
+            route = next((rt for rt in rd.routes_info if rt.get('Description') == rname), None)
+            if not route:
+                continue
+            stops = route.get('Stops', [])
+            if not stops:
+                continue
+            secs = [s.get('SecondsToNextStop', 0) for s in stops]
+            names = [s.get('Description', '') for s in stops]
+            try:
+                i_board = next(i for i, s in enumerate(stops) if s == bstop)
+            except StopIteration:
+                continue
+            dest_idx = next((i for i, nm in enumerate(names) if nm == dest_name), None)
+            if dest_idx is None:
+                continue
+            if dest_idx >= i_board:
+                t_iv = sum(secs[i_board:dest_idx])
+            else:
+                t_iv = sum(secs[i_board:]) + sum(secs[:dest_idx])
+            worst_user_transit_time = max(worst_user_transit_time, t_iv)
+    except Exception:
+        worst_user_wait_time = None
+        worst_user_transit_time = None
+
+    rider_block = {
+        'expected': {
+            'walk_s': expected_walk_time,
+            'wait_s': expected_wait_time,
+            'transit_s': expected_transit_time,
+        },
+        'worstP': {
+            'walk_s': worstP_walk_time,
+            'wait_s': expected_wait_time,   # sunk for FR
+            'transit_s': expected_transit_time,  # sunk for FR
+        },
+        'worst_rider': {
+            'walk_s': max_walk_time,
+        },
+        'worst_user': {
+            'walk_s': max_walk_time,
+            'wait_s': worst_user_wait_time,
+            'transit_s': worst_user_transit_time,
+        }
+    }
+    # Add minutes variants for user metrics for convenience
+    try:
+        rider_block['expected_min'] = {
+            'walk_min': (expected_walk_time or 0.0) / 60.0,
+            'wait_min': (expected_wait_time or 0.0) / 60.0,
+            'transit_min': (expected_transit_time or 0.0) / 60.0,
+        }
+        rider_block['worstP_min'] = {
+            'walk_min': (worstP_walk_time or 0.0) / 60.0 if worstP_walk_time is not None else None,
+            'wait_min': (expected_wait_time or 0.0) / 60.0,
+            'transit_min': (expected_transit_time or 0.0) / 60.0,
+        }
+        rider_block['worst_rider_min'] = {
+            'walk_min': (max_walk_time or 0.0) / 60.0,
+        }
+        rider_block['worst_user_min'] = {
+            'walk_min': (max_walk_time or 0.0) / 60.0,
+            'wait_min': (worst_user_wait_time or 0.0) / 60.0 if worst_user_wait_time is not None else None,
+            'transit_min': (worst_user_transit_time or 0.0) / 60.0 if worst_user_transit_time is not None else None,
+        }
+    except Exception:
+        pass
+
+    return {
+        'rider': rider_block,
+        'provider': provider_dict,
     }
 
 
@@ -171,6 +278,7 @@ def _evaluate_tsp_partition(
     worst_case: bool = True,
     max_dispatch_interval: float = 24.0,
     override_T_by_partition: Dict[str, float] | None = None,
+    epsilon_km: float | None = None,
 ) -> Dict:
     """
     Evaluate TSP last‑mile metrics for a given partition.
@@ -186,7 +294,7 @@ def _evaluate_tsp_partition(
     wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 10.0) * 1.60934)
     # build evaluator only if needed
     rd = RouteData('hct_routes.json', geodata)
-    ev = Evaluate(rd, geodata)
+    ev = Evaluate(rd, geodata, epsilon=epsilon_km if epsilon_km is not None else 1e-3)
 
     # Ensure square assignment and centers
     block_ids = list(geodata.short_geoid_list)
@@ -198,106 +306,144 @@ def _evaluate_tsp_partition(
     # Mass per district (for aggregation); this is with nominal prob
     mass_by_root = _aggregate_prob_by_roots(assignment, block_ids, center_list, prob)
 
-    # Get evaluate outputs per district (worst-case or expected)
-    eval_dict = ev.evaluate_tsp_mode(
+    def build_metrics(eval_dict):
+        per_district = {}
+        for root in center_list:
+            dres = eval_dict[root]
+            T = float(dres['dispatch_interval'])
+            if override_T_by_partition and root in override_T_by_partition:
+                T = float(override_T_by_partition[root])
+
+            wait_per_rider_h = T / 2.0
+
+            dist_interval_service = float(dres['mean_transit_distance_per_interval'])
+            # District mass for aggregation; prefer evaluation's distribution (worst/expected)
+            district_mass = float(dres.get('district_prob', mass_by_root.get(root, 0.0)))
+            # Average in-vehicle service time per rider uses the shared-travel identity:
+            # E[time per rider] = (service distance per interval) / (2 * vehicle speed)
+            # (independent of number of riders), under random drop order.
+            transit_time_per_rider_h = (dist_interval_service / (2.0 * wv))
+
+            # Note: worst-user metric will be finalized after dr_min is computed below
+            rider_worst_user_h = None
+
+            assigned_blocks = _district_blocks(assignment, block_ids, root)
+            # Debug: basic assignment/depot checks
+            try:
+                print(f"[DEBUG] root={root} | T={T:.4f} | assigned={len(assigned_blocks)} | depot_in={depot_id in assigned_blocks}")
+                if assigned_blocks:
+                    sample = assigned_blocks[: min(5, len(assigned_blocks))]
+                    dists_sample = [(b, geodata.get_dist(depot_id, b)) for b in sample]
+                    print(f"[DEBUG] sample depot→block distances (km): {dists_sample}")
+            except Exception:
+                pass
+            if assigned_blocks:
+                dr_min = min(geodata.get_dist(depot_id, b) for b in assigned_blocks)
+            else:
+                dr_min = geodata.get_dist(depot_id, root)
+            linehaul_kmph = (2.0 * dr_min / T) if T > 0 else 0.0
+            if linehaul_kmph == 0.0 and depot_id not in assigned_blocks:
+                print(f"[WARN] linehaul_kmph=0 for root={root}, dr_min={dr_min:.6f}, T={T:.6f}, depot not in district")
+
+            omega_vec = np.zeros(2)
+            for b in assigned_blocks:
+                if b in Omega:
+                    ov = Omega[b]
+                    omega_vec = np.maximum(omega_vec, ov)
+            odd_cost = float(J_function(omega_vec)) / T
+
+            dist_interval_provider_total = dist_interval_service + 2.0 * dr_min
+            travel_kmph = (dist_interval_provider_total / T) if T > 0 else 0.0
+
+            # Add on-board half-linehaul time to average rider transit
+            transit_time_per_rider_h += (dr_min / wv)
+
+            # Worst-user (per district) in TSP mode:
+            # definition: subinterval T plus TSP service time and the outbound half-linehaul time;
+            # do not average by rider count.
+            rider_worst_user_h = T + (dr_min / wv) + (dist_interval_service / wv)
+
+            per_district[root] = {
+                'dispatch_interval_h': T,
+                'rider_wait_h': wait_per_rider_h,
+                'rider_transit_h': transit_time_per_rider_h,
+                'rider_worst_user_h': rider_worst_user_h,
+                'rider_wait_min': wait_per_rider_h * 60.0,
+                'rider_transit_min': transit_time_per_rider_h * 60.0,
+                'rider_worst_user_min': rider_worst_user_h * 60.0,
+                'provider_linehaul_kmph': linehaul_kmph,
+                'provider_odd_cost': odd_cost,
+                'provider_travel_kmph': travel_kmph,
+                'mass': district_mass,
+            }
+        tot_mass = sum(per_district[r]['mass'] for r in center_list) or 1.0
+        rider_wait = sum(per_district[r]['rider_wait_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
+        rider_transit = sum(per_district[r]['rider_transit_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
+        provider_linehaul = sum(per_district[r]['provider_linehaul_kmph'] for r in center_list)
+        provider_odd = sum(per_district[r]['provider_odd_cost'] for r in center_list)
+        provider_travel = sum(per_district[r]['provider_travel_kmph'] for r in center_list)
+        # Aggregate across districts: mass-weighted means for averages, max for worst-user
+        worst_user_max = max(per_district[r]['rider_worst_user_h'] for r in center_list) if center_list else 0.0
+        return per_district, {
+            'rider_wait_h': rider_wait,
+            'rider_transit_h': rider_transit,
+            'rider_worst_user_h': worst_user_max,
+            'rider_wait_min': rider_wait * 60.0,
+            'rider_transit_min': rider_transit * 60.0,
+            'rider_worst_user_min': worst_user_max * 60.0,
+            'provider_linehaul_kmph': provider_linehaul,
+            'provider_odd_cost': provider_odd,
+            'provider_travel_kmph': provider_travel,
+        }
+
+    # Worst-case
+    eval_worst = ev.evaluate_tsp_mode(
         prob_dict=prob,
         node_assignment=assignment,
         center_list=center_list,
         unit_wait_cost=1.0,
         overall_arrival_rate=overall_arrival_rate,
-        worst_case=worst_case,
+        worst_case=True,
         max_dipatch_interval=max_dispatch_interval,
+        fixed_T_by_district=override_T_by_partition,
     )
+    per_worst, agg_worst = build_metrics(eval_worst)
 
-    per_district = {}
-    # Build provider/rider metrics using dispatch intervals
-    for root in center_list:
-        dres = eval_dict[root]
-        T = float(dres['dispatch_interval'])
-        if override_T_by_partition and root in override_T_by_partition:
-            T = float(override_T_by_partition[root])
-
-        # Rider: wait per rider (hours)
-        wait_per_rider_h = T / 2.0
-
-        # Rider: transit per rider (hours)
-        #  - service leg: (km per interval) / (riders per interval) / (km/h)
-        dist_interval = float(dres['mean_transit_distance_per_interval'])  # km per interval (aggregate)
-        district_mass = mass_by_root.get(root, 0.0)
-        riders_per_interval = overall_arrival_rate * district_mass * T
-        if riders_per_interval > 0:
-            transit_time_per_rider_h = (dist_interval / riders_per_interval) / (wv)
-        else:
-            transit_time_per_rider_h = 0.0
-
-        # Provider: linehaul + ODD + travel
-        #  - linehaul: use shortest depot→district distance, robust to whether roots have been relocated
-        assigned_blocks = _district_blocks(assignment, block_ids, root)
-        if assigned_blocks:
-            dr_min = min(geodata.get_dist(depot_id, b) for b in assigned_blocks)  # km
-        else:
-            dr_min = geodata.get_dist(depot_id, root)  # km
-        # Distance rate (km/h) for linehaul over time: 2*distance per cycle divided by interval length T
-        linehaul_kmph = (2.0 * dr_min) / T
-
-        #  - ODD cost: J(max Omega in district)/T treated as minutes proxy (already a scalar). Keep as is.
-        omega_vec = np.zeros(2)
-        for b in assigned_blocks:
-            if b in Omega:
-                ov = Omega[b]
-                # elementwise max
-                omega_vec = np.maximum(omega_vec, ov)
-        odd_cost = float(J_function(omega_vec)) / T
-
-        #  - travel: amt_transit_distance is already km per hour
-        amt_transit_distance = float(dres['amt_transit_distance'])  # km per hour
-        travel_kmph = amt_transit_distance
-
-        #  - on-board linehaul leg per rider: half of the linehaul time (outbound)
-        transit_time_per_rider_h += (dr_min / wv)
-
-        per_district[root] = {
-            'dispatch_interval_h': T,
-            'rider_wait_h': wait_per_rider_h,
-            'rider_transit_h': transit_time_per_rider_h,
-            'provider_linehaul_kmph': linehaul_kmph,
-            'provider_odd_cost': odd_cost,
-            'provider_travel_kmph': travel_kmph,
-            'mass': district_mass,
-        }
-
-    # Aggregate by mass (riders) and sum provider components
-    tot_mass = sum(per_district[r]['mass'] for r in center_list) or 1.0
-    rider_wait = sum(per_district[r]['rider_wait_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
-    rider_transit = sum(per_district[r]['rider_transit_h'] * per_district[r]['mass'] for r in center_list) / tot_mass
-    provider_linehaul = sum(per_district[r]['provider_linehaul_kmph'] for r in center_list)
-    provider_odd = sum(per_district[r]['provider_odd_cost'] for r in center_list)
-    provider_travel = sum(per_district[r]['provider_travel_kmph'] for r in center_list)
+    # Expected (nominal)
+    eval_exp = ev.evaluate_tsp_mode(
+        prob_dict=prob,
+        node_assignment=assignment,
+        center_list=center_list,
+        unit_wait_cost=1.0,
+        overall_arrival_rate=overall_arrival_rate,
+        worst_case=False,
+        max_dipatch_interval=max_dispatch_interval,
+        fixed_T_by_district=override_T_by_partition,
+    )
+    per_exp, agg_exp = build_metrics(eval_exp)
 
     return {
-        'per_district': per_district,
-        'aggregate': {
-            'rider_wait_h': rider_wait,
-            'rider_transit_h': rider_transit,
-            'provider_linehaul_kmph': provider_linehaul,
-            'provider_odd_cost': provider_odd,
-            'provider_travel_kmph': provider_travel,
-        }
+        'per_district_worst': per_worst,
+        'aggregate_worst': agg_worst,
+        'per_district_expected': per_exp,
+        'aggregate_expected': agg_exp,
     }
 
 
 def run(method: str, num_districts: int, visualize_baseline: bool = False, max_iters: int = 200,
-        overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5):
+        overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5, epsilon_km_arg: float | None = None):
     geodata = load_geodata()
     # Set speeds (mph) from routes and walking baseline
     wv_kmh, wr_kmh = set_geodata_speeds(geodata, 'hct_routes.json', walk_kmh=5.0)
     prob = load_probability_from_population(geodata)
     Omega = load_real_odd()
+    # Wasserstein radius (km): user-provided or average block diameter (km)
+    epsilon_km = epsilon_km_arg if epsilon_km_arg is not None else _avg_block_diameter_km(geodata)
 
     # Baseline assignment from routes
     base_assign_small, centers = load_baseline_assignment(geodata, visualize=visualize_baseline)
 
-    part = Partition(geodata, num_districts=num_districts, prob_dict=prob, epsilon=0.1)
+    part = Partition(geodata, num_districts=num_districts, prob_dict=prob, epsilon=epsilon_km)
     base_assign = expand_to_square(part, base_assign_small, centers)
     base_metrics = evaluate_design(part, base_assign, prob, Omega)
 
@@ -366,7 +512,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
 
     # ---------- Extended Evaluation Scenarios ----------
     # 1) Fixed-route under original (route-based) partition
-    fr_eval = _evaluate_fixed_route_full(geodata, prob)
+    fr_eval = _evaluate_fixed_route_full(geodata, prob, epsilon_km)
 
     # Helper: extract center list for partitions (columns with any assignment)
     block_ids = list(geodata.short_geoid_list)
@@ -406,13 +552,13 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         geodata, base_assign, base_roots, prob, Omega, base_depot,
         overall_arrival_rate=overall_arrival_rate,
         worst_case=True, max_dispatch_interval=24.0,
-        override_T_by_partition=T_override_base,
+        override_T_by_partition=T_override_base, epsilon_km=epsilon_km,
     )
     tsp_base_constrained = _evaluate_tsp_partition(
         geodata, base_assign, base_roots, prob, Omega, base_depot,
         overall_arrival_rate=overall_arrival_rate,
         worst_case=True, max_dispatch_interval=max_dispatch_cap,
-        override_T_by_partition=T_override_base,
+        override_T_by_partition=T_override_base, epsilon_km=epsilon_km,
     )
 
     # 3) TSP under optimal partition (use T* returned by optimization if available; unconstrained + constrained)
@@ -435,13 +581,13 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         geodata, opt_assign, opt_roots, prob, Omega, opt_depot,
         overall_arrival_rate=overall_arrival_rate,
         worst_case=True, max_dispatch_interval=24.0,
-        override_T_by_partition=T_override,
+        override_T_by_partition=T_override, epsilon_km=epsilon_km,
     )
     tsp_opt_constrained = _evaluate_tsp_partition(
         geodata, opt_assign, opt_roots, prob, Omega, opt_depot,
         overall_arrival_rate=overall_arrival_rate,
         worst_case=True, max_dispatch_interval=max_dispatch_cap,
-        override_T_by_partition=T_override,
+        override_T_by_partition=T_override, epsilon_km=epsilon_km,
     )
 
     # Report & save
@@ -469,33 +615,107 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
 
     # Also emit a compact CSV-like table for quick comparison
     table_lines = []
-    table_lines.append('Design,Perspective,Metric,WorstP_h,Expected_h,ProviderWorst_kmph,ProviderExpected_kmph')
+    table_lines.append('Design,Perspective,Metric,WorstP_min,Expected_min,ProviderWorst_kmph,ProviderExpected_kmph')
     # FR
     fr_r = fr_eval['rider']
     fr_p = fr_eval['provider']
-    # Convert FR rider seconds to hours
-    fr_walk_worstP_h = (fr_r['worstP']['walk_s'] or 0.0) / 3600.0
-    fr_walk_exp_h = (fr_r['expected']['walk_s'] or 0.0) / 3600.0
-    fr_wait_exp_h = (fr_r['expected']['wait_s'] or 0.0) / 3600.0
-    fr_transit_exp_h = (fr_r['expected']['transit_s'] or 0.0) / 3600.0
-    table_lines.append(f"P0 FR,Rider,walk,{fr_walk_worstP_h},{fr_walk_exp_h},,")
-    table_lines.append(f"P0 FR,Rider,wait,,{fr_wait_exp_h},,")
-    table_lines.append(f"P0 FR,Rider,transit,,{fr_transit_exp_h},,")
+    # Convert FR rider seconds to minutes
+    fr_walk_worstP_min = (fr_r['worstP']['walk_s'] or 0.0) / 60.0 if fr_r['worstP']['walk_s'] is not None else None
+    fr_walk_exp_min = (fr_r['expected']['walk_s'] or 0.0) / 60.0
+    fr_wait_exp_min = (fr_r['expected']['wait_s'] or 0.0) / 60.0
+    fr_transit_exp_min = (fr_r['expected']['transit_s'] or 0.0) / 60.0
+    table_lines.append(f"P0 FR,Rider,walk,{fr_walk_worstP_min},{fr_walk_exp_min},,")
+    table_lines.append(f"P0 FR,Rider,wait,,{fr_wait_exp_min},,")
+    table_lines.append(f"P0 FR,Rider,transit,,{fr_transit_exp_min},,")
+    # FR provider (identical for worst/expected); use travel_kmph aggregate, no linehaul
+    fr_provider = fr_eval.get('provider', {})
+    try:
+        fr_provider_worst = fr_provider.get('worst', {})
+        fr_provider_exp = fr_provider.get('expected', {})
+        fr_travel_worst = fr_provider_worst.get('travel_kmph')
+        fr_travel_exp = fr_provider_exp.get('travel_kmph')
+        if fr_travel_worst is not None and fr_travel_exp is not None:
+            table_lines.append(f"P0 FR,Provider,travel,,,{fr_travel_worst},{fr_travel_exp}")
+    except Exception:
+        pass
     # TSP original
     for tag, res in [('P0 TSP unconstrained', tsp_base_unconstrained), ('P0 TSP constrained', tsp_base_constrained)]:
-        agg = res['aggregate']
-        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_h']},,{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']},{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']}")
-        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_h']},,,")
+        aggW = res['aggregate_worst']; aggE = res['aggregate_expected']
+        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_linehaul_kmph']+aggW['provider_travel_kmph']},{aggE['provider_linehaul_kmph']+aggE['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,transit,{aggW['rider_transit_min']},{aggE['rider_transit_min']},,")
     # TSP optimal
     for tag, res in [('P* TSP unconstrained', tsp_opt_unconstrained), ('P* TSP constrained', tsp_opt_constrained)]:
-        agg = res['aggregate']
-        table_lines.append(f"{tag},Rider,wait,{agg['rider_wait_h']},,{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']},{agg['provider_linehaul_kmph']+agg['provider_travel_kmph']}")
-        table_lines.append(f"{tag},Rider,transit,{agg['rider_transit_h']},,,")
+        aggW = res['aggregate_worst']; aggE = res['aggregate_expected']
+        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_linehaul_kmph']+aggW['provider_travel_kmph']},{aggE['provider_linehaul_kmph']+aggE['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,transit,{aggW['rider_transit_min']},{aggE['rider_transit_min']},,")
 
     table_path = os.path.join('lbbd_results', f'real_case_table_{ts}.csv')
     with open(table_path, 'w') as f:
         f.write('\n'.join(table_lines))
     print(f"Saved summary to {summary_path} and table to {table_path}")
+
+    # ---------- Partition plots (before vs after optimization) ----------
+    try:
+        fig_dir = 'figures'
+        os.makedirs(fig_dir, exist_ok=True)
+        out_fig = os.path.join(fig_dir, f'partitions_before_after_{ts}.pdf')
+
+        def _left_panel(ax):
+            """Plot FR partition by nearest route on ax with routes overlay."""
+            rd = RouteData('hct_routes.json', geodata)
+            # Assign each block group to nearest route name
+            nearest = rd.find_nearest_stops()
+            gdf = geodata.gdf.copy()
+            gdf['district'] = gdf.index.map(lambda idx: nearest[idx]['route'] if idx in nearest else 'Unassigned')
+            # Color by route
+            routes = sorted(gdf['district'].unique())
+            cmap = plt.get_cmap('tab20', len(routes))
+            color_map = {r: cmap(i) for i, r in enumerate(routes)}
+            for r in routes:
+                gdf[gdf['district'] == r].plot(ax=ax, color=color_map[r], edgecolor='white', linewidth=0.3)
+            # Overlay routes
+            for route in rd.routes_info:
+                name = route.get('Description', f"Route {route.get('RouteID')}")
+                color = route.get('MapLineColor', '#008080')
+                poly = route.get('EncodedPolyline')
+                if poly:
+                    try:
+                        coords = polyline.decode(poly)
+                        line = LineString([(lng, lat) for (lat, lng) in coords])
+                        proj = rd.project_geometry(line)
+                        ax.plot(*proj.xy, color=color, linewidth=1.2, alpha=0.9)
+                    except Exception:
+                        pass
+            ax.set_title('Original FR partition (nearest route)')
+            ax.set_axis_off()
+
+        def _right_panel(ax):
+            """Plot optimized partition from assignment on ax."""
+            # Use opt_assign (square) already computed
+            assign = opt_assign
+            block_ids = list(geodata.short_geoid_list)
+            labels = []
+            for i, bi in enumerate(block_ids):
+                # Find assigned column
+                col = int(np.argmax(assign[i, :])) if assign[i, :].sum() > 0 else -1
+                labels.append(col)
+            gdf = geodata.gdf.copy()
+            gdf['district'] = labels
+            districts = sorted([d for d in set(labels) if d >= 0])
+            cmap = plt.get_cmap('tab10', max(1, len(districts)))
+            for idx, d in enumerate(districts):
+                gdf[gdf['district'] == d].plot(ax=ax, color=cmap(idx), edgecolor='white', linewidth=0.3)
+            ax.set_title('Optimized partition (robust TSP)')
+            ax.set_axis_off()
+
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
+        _left_panel(axes[0])
+        _right_panel(axes[1])
+        fig.savefig(out_fig, dpi=200)
+        plt.close(fig)
+        print(f"Saved partition plot to {out_fig}")
+    except Exception as e:
+        print(f"Partition plotting skipped due to error: {e}")
 
 
 def main():
@@ -506,8 +726,10 @@ def main():
     ap.add_argument('--iters', type=int, default=200)
     ap.add_argument('--arrival-rate', type=float, default=100.0, help='Overall arrival rate per hour for TSP evaluation')
     ap.add_argument('--Tmax', type=float, default=1.5, help='Constrained dispatch subinterval cap (hours)')
+    ap.add_argument('--epsilon-km', type=float, default=None, help='Wasserstein radius in km (default: avg block diameter)')
     args = ap.parse_args()
-    run(args.method, args.districts, args.visualize_baseline, args.iters, overall_arrival_rate=args.arrival_rate, max_dispatch_cap=args.Tmax)
+    run(args.method, args.districts, args.visualize_baseline, args.iters,
+        overall_arrival_rate=args.arrival_rate, max_dispatch_cap=args.Tmax, epsilon_km_arg=args.epsilon_km)
 
 
 if __name__ == '__main__':
