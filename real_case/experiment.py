@@ -107,7 +107,9 @@ def _avg_block_diameter_km(geodata) -> float:
     return float(diam_km.mean()) if len(diam_km) else 0.1
 
 
-def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: float) -> Dict:
+def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: float,
+                               Omega: Dict[str, np.ndarray] | None = None,
+                               J_function_ref=None) -> Dict:
     """Evaluate Fixed-Route (FR) rider metrics using nearest stops and SimPy wait/transit simulation.
     Provider metrics are left as None (route operations treated as sunk in this framework).
     Returns a dict with expected and worst-P rider metrics.
@@ -156,24 +158,59 @@ def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: floa
     try:
         fr_eval_basic = ev.evaluate_fixed_route(prob_dict=prob, simulate=False)
         # route_lengths are in projected meters (EPSG:2163), travel_times in seconds
-        total_length_m = sum(float(v) for v in fr_eval_basic.get('route_lengths', {}).values())
-        total_secs = sum(float(v) for v in fr_eval_basic.get('travel_times', {}).values())
-        total_km = total_length_m / 1000.0
-        total_h = total_secs / 3600.0 if total_secs > 0 else 0.0
-        provider_travel_kmph = (total_km / total_h) if total_h > 0 else 0.0
+        route_lengths_m = fr_eval_basic.get('route_lengths', {})
+        route_times_s = fr_eval_basic.get('travel_times', {})
+        # Sum per-route speeds: Σ (length_i/time_i) in km/h
+        provider_travel_kmph = 0.0
+        for rname, length_m in route_lengths_m.items():
+            secs = float(route_times_s.get(rname, 0.0))
+            if secs > 0:
+                kmph = (float(length_m) / 1000.0) / (secs / 3600.0)
+                provider_travel_kmph += kmph
     except Exception:
         provider_travel_kmph = None
+
+    # Compute ODD provider cost for FR by forming FR districts via nearest-stop assignment
+    # and taking J(max Omega in district) divided by the route headway (hours), summed over routes
+    provider_odd_cost = None
+    try:
+        assignment_fr, centers_fr = rd.build_assignment_matrix(visualize=False)
+        # Map each center to its route name and headway
+        route_headway_h = {}
+        for route in rd.routes_info:
+            name = route.get('Description', f"Route {route.get('RouteID')}")
+            secs = [s.get('SecondsToNextStop', 0) for s in route.get('Stops', [])]
+            route_headway_h[name] = (sum(secs) / 3600.0) if secs else None
+        # rd.center_nodes: district name (route Description) -> center short_GEOID
+        center_name_by_id = {center: name for name, center in getattr(rd, 'center_nodes', {}).items()}
+        block_ids = list(geodata.short_geoid_list)
+        provider_odd_cost = 0.0
+        if Omega is not None and (J_function_ref is not None):
+            for j, center in enumerate(centers_fr):
+                # Determine headway for this center's route
+                rname = center_name_by_id.get(center)
+                H = route_headway_h.get(rname) if rname in route_headway_h else None
+                # Aggregate element-wise max Omega over assigned blocks
+                omega_vec = None
+                for i, bid in enumerate(block_ids):
+                    if round(assignment_fr[i, j]) == 1 and bid in Omega:
+                        ov = np.array(Omega[bid], dtype=float)
+                        omega_vec = ov if omega_vec is None else np.maximum(omega_vec, ov)
+                if omega_vec is not None and H and H > 0:
+                    provider_odd_cost += float(J_function_ref(omega_vec)) / H
+    except Exception:
+        provider_odd_cost = None
 
     provider_dict = {
         'expected': {
             'linehaul_kmph': 0.0 if provider_travel_kmph is not None else None,
             'travel_kmph': provider_travel_kmph,
-            'odd_cost': 0.0 if provider_travel_kmph is not None else None,
+            'odd_cost': provider_odd_cost,
         },
         'worst': {
             'linehaul_kmph': 0.0 if provider_travel_kmph is not None else None,
             'travel_kmph': provider_travel_kmph,
-            'odd_cost': 0.0 if provider_travel_kmph is not None else None,
+            'odd_cost': provider_odd_cost,
         }
     }
 
@@ -512,7 +549,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
 
     # ---------- Extended Evaluation Scenarios ----------
     # 1) Fixed-route under original (route-based) partition
-    fr_eval = _evaluate_fixed_route_full(geodata, prob, epsilon_km)
+    fr_eval = _evaluate_fixed_route_full(geodata, prob, epsilon_km, Omega=Omega, J_function_ref=J_function)
 
     # Helper: extract center list for partitions (columns with any assignment)
     block_ids = list(geodata.short_geoid_list)
@@ -615,7 +652,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
 
     # Also emit a compact CSV-like table for quick comparison
     table_lines = []
-    table_lines.append('Design,Perspective,Metric,WorstP_min,Expected_min,ProviderWorst_kmph,ProviderExpected_kmph')
+    table_lines.append('Design,Perspective,Metric,WorstP_min,Expected_min,ProviderWorst_total_kmph,ProviderExpected_total_kmph')
     # FR
     fr_r = fr_eval['rider']
     fr_p = fr_eval['provider']
