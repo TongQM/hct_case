@@ -109,6 +109,62 @@ def load_probability_from_population(geodata: GeoData) -> Dict[str, float]:
     return dict(zip(df['short_GEOID'], df['p']))
 
 
+def load_probability_from_commuting(geodata: GeoData,
+                                    tract_csv: str = '2023_target_tract_commuting/2023_target_tract_commuting.csv',
+                                    bg_csv: str = '2023_target_blockgroup_population/2023_target_blockgroup_population.csv') -> Dict[str, float]:
+    """Replicate the notebook's nominal mass based on ACS commuting counts.
+
+    Steps (matching data_process.ipynb logic):
+    - For each tract, compute tract_commuting = carpooled + public transportation + taxicab/motorcycle/other
+      using S0801 estimate columns.
+    - For each block group, compute its population share within the tract.
+    - Demand at block group = tract_commuting * population_share.
+    - Normalize over the selected BG set to produce a probability dict.
+    """
+    # Load tract-level commuting counts
+    if not os.path.exists(tract_csv) or not os.path.exists(bg_csv):
+        # Fallback to population-based if inputs are missing
+        return load_probability_from_population(geodata)
+
+    import pandas as pd
+    tract = pd.read_csv(tract_csv, dtype=str)
+    # Ensure numeric for needed estimates
+    for c in ['S0801_C01_004E', 'S0801_C01_009E', 'S0801_C01_012E']:
+        if c not in tract.columns:
+            # Columns not present; fallback
+            return load_probability_from_population(geodata)
+        tract[c] = pd.to_numeric(tract[c], errors='coerce').fillna(0.0)
+    # Extract 6-digit tract GEOID from GEO_ID
+    # Example GEO_ID like '1400000US42003504100' -> short tract '504100'
+    tract['short_tract_GEOID'] = tract['GEO_ID'].str[-6:]
+    tract['tract_commuting'] = tract['S0801_C01_004E'] + tract['S0801_C01_009E'] + tract['S0801_C01_012E']
+    tract_comm = tract[['short_tract_GEOID', 'tract_commuting']]
+
+    # Load block-group population and compute share within tract
+    bg = pd.read_csv(bg_csv, dtype={'GEO_ID': str, 'B02001_001E': float})
+    bg['short_GEOID'] = bg['GEO_ID'].str[-7:]
+    bg['short_tract_GEOID'] = bg['GEO_ID'].str[-7:-1]  # drop the last digit (block-group id)
+    # tract population from BG sum
+    tract_pop = (
+        bg.groupby('short_tract_GEOID', as_index=False)['B02001_001E']
+          .sum().rename(columns={'B02001_001E': 'tract_population'})
+    )
+    bg = bg.merge(tract_pop, on='short_tract_GEOID', how='left')
+    bg['population_share'] = bg['B02001_001E'] / bg['tract_population']
+
+    # Merge commuting counts onto BG, compute BG commuting demand
+    bg = bg.merge(tract_comm, on='short_tract_GEOID', how='left')
+    bg['bg_commuting'] = bg['population_share'] * bg['tract_commuting']
+
+    # Filter to model's BGs
+    bg = bg[bg['short_GEOID'].isin(geodata.short_geoid_list)]
+    total = float(bg['bg_commuting'].sum())
+    if total <= 0:
+        return load_probability_from_population(geodata)
+    bg['p'] = bg['bg_commuting'] / total
+    return dict(zip(bg['short_GEOID'], bg['p']))
+
+
 def load_real_odd(csv_path: str = 'data/bg_odd_features_real.csv') -> Dict[str, np.ndarray]:
     df = pd.read_csv(csv_path, dtype={'short_GEOID': str})
     return {r['short_GEOID']: np.array([r['omega1'], r['omega2']], dtype=float) for _, r in df.iterrows()}

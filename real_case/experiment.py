@@ -21,6 +21,7 @@ from datetime import datetime
 from real_case.inputs import (
     load_geodata,
     load_probability_from_population,
+    load_probability_from_commuting,
     load_real_odd,
     load_baseline_assignment,
     set_geodata_speeds,
@@ -468,11 +469,16 @@ def _evaluate_tsp_partition(
 
 
 def run(method: str, num_districts: int, visualize_baseline: bool = False, max_iters: int = 200,
-        overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5, epsilon_km_arg: float | None = None):
+        overall_arrival_rate: float = 1000.0, max_dispatch_cap: float = 1.5, epsilon_km_arg: float | None = None,
+        demand_source: str = 'population'):
     geodata = load_geodata()
     # Set speeds (mph) from routes and walking baseline
     wv_kmh, wr_kmh = set_geodata_speeds(geodata, 'hct_routes.json', walk_kmh=5.0)
-    prob = load_probability_from_population(geodata)
+    # Nominal distribution: match notebook if requested
+    if str(demand_source).lower().startswith('commut'):
+        prob = load_probability_from_commuting(geodata)
+    else:
+        prob = load_probability_from_population(geodata)
     Omega = load_real_odd()
     # Wasserstein radius (km): user-provided or average block diameter (km)
     epsilon_km = epsilon_km_arg if epsilon_km_arg is not None else _avg_block_diameter_km(geodata)
@@ -678,18 +684,104 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     # TSP original
     for tag, res in [('P0 TSP unconstrained', tsp_base_unconstrained), ('P0 TSP constrained', tsp_base_constrained)]:
         aggW = res['aggregate_worst']; aggE = res['aggregate_expected']
-        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_linehaul_kmph']+aggW['provider_travel_kmph']},{aggE['provider_linehaul_kmph']+aggE['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_travel_kmph']},{aggE['provider_travel_kmph']}")
         table_lines.append(f"{tag},Rider,transit,{aggW['rider_transit_min']},{aggE['rider_transit_min']},,")
     # TSP optimal
     for tag, res in [('P* TSP unconstrained', tsp_opt_unconstrained), ('P* TSP constrained', tsp_opt_constrained)]:
         aggW = res['aggregate_worst']; aggE = res['aggregate_expected']
-        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_linehaul_kmph']+aggW['provider_travel_kmph']},{aggE['provider_linehaul_kmph']+aggE['provider_travel_kmph']}")
+        table_lines.append(f"{tag},Rider,wait,{aggW['rider_wait_min']},{aggE['rider_wait_min']},{aggW['provider_travel_kmph']},{aggE['provider_travel_kmph']}")
         table_lines.append(f"{tag},Rider,transit,{aggW['rider_transit_min']},{aggE['rider_transit_min']},,")
 
+    os.makedirs('lbbd_results', exist_ok=True)
     table_path = os.path.join('lbbd_results', f'real_case_table_{ts}.csv')
     with open(table_path, 'w') as f:
         f.write('\n'.join(table_lines))
-    print(f"Saved summary to {summary_path} and table to {table_path}")
+    # --- Also emit a LaTeX table in the target format ---
+    def _fmt(x):
+        return ("" if x is None else f"{x:.2f}")
+
+    # FR user mins
+    fr_worst_user = fr_r.get('worst_user_min', {})
+    fr_worstP = fr_r.get('worstP_min', {})
+    fr_expected = fr_r.get('expected_min', {})
+
+    fr_walk_wu = fr_worst_user.get('walk_min')
+    fr_wait_wu = fr_worst_user.get('wait_min')
+    fr_trans_wu = fr_worst_user.get('transit_min')
+    fr_total_wu = sum(v for v in [fr_walk_wu, fr_wait_wu, fr_trans_wu] if v is not None) if any(
+        v is not None for v in [fr_walk_wu, fr_wait_wu, fr_trans_wu]
+    ) else None
+
+    fr_walk_wp = fr_worstP.get('walk_min')
+    fr_wait_wp = fr_worstP.get('wait_min')
+    fr_trans_wp = fr_worstP.get('transit_min')
+    fr_total_wp = sum(v for v in [fr_walk_wp, fr_wait_wp, fr_trans_wp] if v is not None) if any(
+        v is not None for v in [fr_walk_wp, fr_wait_wp, fr_trans_wp]
+    ) else None
+
+    fr_walk_ex = fr_expected.get('walk_min')
+    fr_wait_ex = fr_expected.get('wait_min')
+    fr_trans_ex = fr_expected.get('transit_min')
+    fr_total_ex = sum(v for v in [fr_walk_ex, fr_wait_ex, fr_trans_ex] if v is not None) if any(
+        v is not None for v in [fr_walk_ex, fr_wait_ex, fr_trans_ex]
+    ) else None
+
+    # TSP aggregates (unconstrained only for the paper-style table)
+    bW, bE = tsp_base_unconstrained['aggregate_worst'], tsp_base_unconstrained['aggregate_expected']
+    oW, oE = tsp_opt_unconstrained['aggregate_worst'], tsp_opt_unconstrained['aggregate_expected']
+
+    # Build LaTeX
+    latex_lines = []
+    latex_lines.append("\\begin{table*}[t]")
+    latex_lines.append("\\centering")
+    latex_lines.append("\\caption{Comparison of Travel Time (minutes) and Provider Distance Rate (km/h)}")
+    latex_lines.append("\\begin{tabular}{l l r r r r r}")
+    latex_lines.append("\\toprule")
+    latex_lines.append("\\textbf{Design} & \\textbf{Metric} & ")
+    latex_lines.append("\\multicolumn{3}{c}{\\textbf{User Perspective (min)}} & ")
+    latex_lines.append("\\multicolumn{2}{c}{\\textbf{Provider (km/h)}} " + "\\\\")
+    latex_lines.append("\\cmidrule(lr){3-5}\\cmidrule(lr){6-7}")
+    latex_lines.append("& & \\textbf{Worst-user} & \\textbf{Worst-P} & \\textbf{Expected} & \\textbf{Worst} & \\textbf{Expected} " + "\\\\")
+    latex_lines.append("\\midrule")
+    # FR rows
+    latex_lines.append(f"$\\mathcal{{P}}_0$ FR & walk    & {_fmt(fr_walk_wu)} & {_fmt(fr_walk_wp)} & {_fmt(fr_walk_ex)} &        &        " + "\\\\")
+    latex_lines.append(f"                   & wait    & {_fmt(fr_wait_wu)} & {_fmt(fr_wait_wp)} & {_fmt(fr_wait_ex)} & {_fmt(fr_travel_worst)}  & {_fmt(fr_travel_exp)}  " + "\\\\")
+    latex_lines.append(f"                   & transit & {_fmt(fr_trans_wu)} & {_fmt(fr_trans_wp)} & {_fmt(fr_trans_ex)} &        &        " + "\\\\")
+    latex_lines.append(f"                   & total   & {_fmt(fr_total_wu)} & {_fmt(fr_total_wp)} & {_fmt(fr_total_ex)} &       &        " + "\\\\")
+    # ODD line (per hour)
+    fr_odd = fr_provider_exp.get('odd_cost') if fr_provider else None
+    latex_lines.append(f"                   & ODD (per h) &  &  &  & \\multicolumn{{2}}{{c}}{{{_fmt(fr_odd)}}} " + "\\\\")
+    latex_lines.append("\\midrule")
+    # P0 TSP (unconstrained)
+    latex_lines.append(
+        f"$\\mathcal{{P}}_0$ TSP (unconstrained) & wait    &  & {_fmt(bW['rider_wait_min'])} & {_fmt(bE['rider_wait_min'])} & {_fmt(bW['provider_travel_kmph'])} & {_fmt(bE['provider_travel_kmph'])} " + "\\\\")
+    latex_lines.append(
+        f"                                    & transit &  & {_fmt(bW['rider_transit_min'])} & {_fmt(bE['rider_transit_min'])} &        &       " + "\\\\")
+    latex_lines.append(
+        f"                                    & total   & {_fmt(bW['rider_worst_user_min'])} & {_fmt(bW['rider_wait_min'] + bW['rider_transit_min'])} & {_fmt(bE['rider_wait_min'] + bE['rider_transit_min'])} &        &       " + "\\\\")
+    latex_lines.append("\\midrule")
+    # P* TSP (unconstrained)
+    latex_lines.append(
+        f"$\\mathcal{{P}}^*$ TSP (unconstrained) & wait    &  & {_fmt(oW['rider_wait_min'])} & {_fmt(oE['rider_wait_min'])} & {_fmt(oW['provider_travel_kmph'])} & {_fmt(oE['provider_travel_kmph'])} " + "\\\\")
+    latex_lines.append(
+        f"                                    & transit &  & {_fmt(oW['rider_transit_min'])} & {_fmt(oE['rider_transit_min'])} &        &       " + "\\\\")
+    latex_lines.append(
+        f"                                    & total   & {_fmt(oW['rider_worst_user_min'])} & {_fmt(oW['rider_wait_min'] + oW['rider_transit_min'])} & {_fmt(oE['rider_wait_min'] + oE['rider_transit_min'])} &        &       " + "\\\\")
+    latex_lines.append("\\bottomrule")
+    latex_lines.append("\\end{tabular}")
+    latex_lines.append("")
+    latex_lines.append("\\vspace{0.5ex}")
+    latex_lines.append("\\small")
+    latex_lines.append(
+        f"Notes: FR Worst-P uses worstP\\_min; provider values are aggregate travel km/h; ODD from odd\\_cost. Source: {summary_path}."
+    )
+    latex_lines.append("\\end{table*}")
+
+    latex_path = os.path.join('results', f'real_case_table_{ts}.tex')
+    with open(latex_path, 'w') as f:
+        f.write("\n".join(latex_lines))
+
+    print(f"Saved summary to {summary_path}, table to {table_path}, and LaTeX to {latex_path}")
 
     # ---------- Partition plots (before vs after optimization) ----------
     try:
@@ -723,6 +815,12 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
                         ax.plot(*proj.xy, color=color, linewidth=1.2, alpha=0.9)
                     except Exception:
                         pass
+            # Highlight baseline depot block boundary in red
+            try:
+                if base_depot in gdf.index:
+                    gdf.loc[[base_depot]].boundary.plot(ax=ax, color='red', linewidth=2.0, zorder=5)
+            except Exception:
+                pass
             ax.set_title('Original FR partition (nearest route)')
             ax.set_axis_off()
 
@@ -742,6 +840,12 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
             cmap = plt.get_cmap('tab10', max(1, len(districts)))
             for idx, d in enumerate(districts):
                 gdf[gdf['district'] == d].plot(ax=ax, color=cmap(idx), edgecolor='white', linewidth=0.3)
+            # Highlight optimized depot block boundary in red
+            try:
+                if metrics['depot'] in gdf.index:
+                    gdf.loc[[metrics['depot']]].boundary.plot(ax=ax, color='red', linewidth=2.2, zorder=6)
+            except Exception:
+                pass
             ax.set_title('Optimized partition (robust TSP)')
             ax.set_axis_off()
 
@@ -764,9 +868,11 @@ def main():
     ap.add_argument('--arrival-rate', type=float, default=100.0, help='Overall arrival rate per hour for TSP evaluation')
     ap.add_argument('--Tmax', type=float, default=1.5, help='Constrained dispatch subinterval cap (hours)')
     ap.add_argument('--epsilon-km', type=float, default=None, help='Wasserstein radius in km (default: avg block diameter)')
+    ap.add_argument('--demand-source', choices=['population', 'commuting'], default='population', help='Nominal mass source')
     args = ap.parse_args()
     run(args.method, args.districts, args.visualize_baseline, args.iters,
-        overall_arrival_rate=args.arrival_rate, max_dispatch_cap=args.Tmax, epsilon_km_arg=args.epsilon_km)
+        overall_arrival_rate=args.arrival_rate, max_dispatch_cap=args.Tmax, epsilon_km_arg=args.epsilon_km,
+        demand_source=args.demand_source)
 
 
 if __name__ == '__main__':
