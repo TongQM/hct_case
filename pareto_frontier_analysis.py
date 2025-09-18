@@ -299,7 +299,7 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
     print(f"🎯 Starting Pareto Frontier Analysis")
     print(f"   Grid: {grid_size}×{grid_size} ({grid_size**2} blocks)")
     print(f"   Districts: {num_districts}")
-    print(f"   wr/wv ratios: {num_wr_wv_points} points")
+    print(f"   theta points: {num_wr_wv_points}")
     print(f"   Max iterations: {max_iters}")
     print(f"   Trials per ratio: {trials}")
     
@@ -309,9 +309,15 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
     nominal_prob = create_nominal_distribution(grid_size, seed=seed)
     Omega_dict, J_function = create_omega_distribution(grid_size, seed=seed)
     
-    # Define wr/wv ratio range (log scale for better coverage)
-    # Lower ratios favor provider efficiency, higher ratios favor user experience
-    wr_wv_ratios = np.logspace(-1, 1, num_wr_wv_points)  # 0.1 to 10.0
+    # Fix base speeds for evaluation (km/h or consistent units)
+    wr_base = 5.04
+    wv_base = 18.710765208297367
+    geo_data.wr = wr_base
+    geo_data.wv = wv_base
+
+    # Define theta in (0,1]; lower theta emphasizes provider cost, higher theta emphasizes user cost
+    # Avoid theta=0 to prevent division by zero when forming wr_eff = wr_base * ((1-theta)/theta)
+    thetas = np.linspace(0.05, 1.0, num_wr_wv_points)
     
     # Fixed parameters
     Lambda = 25.0
@@ -320,15 +326,12 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
     
     pareto_points = []
     
-    for i, ratio in enumerate(wr_wv_ratios):
-        print(f"\n📊 Point {i+1}/{num_wr_wv_points}: wr/wv = {ratio:.3f}")
-        
-        # Set wr and wv based on ratio
-        # Keep wv reasonable (vehicle speed around 10 mph), adjust wr
-        wv = 10.0
-        wr = ratio * wv
-        
-        print(f"   wr = {wr:.3f}, wv = {wv:.3f}")
+    for i, theta in enumerate(thetas):
+        print(f"\n📊 Point {i+1}/{num_wr_wv_points}: theta = {theta:.3f}")
+        # Effective wr passed into optimizer to realize provider + ((1-theta)/theta)*user
+        wr_eff = wr_base * ((1.0 - theta) / theta)
+        wv_eff = wv_base
+        print(f"   wr_eff = {wr_eff:.3f}, wv_eff = {wv_eff:.3f} (evaluation uses wr={wr_base:.3f}, wv={wv_base:.3f})")
         
         user_list = []
         prov_list = []
@@ -338,9 +341,9 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
         depot_last = None
         centers_last = None
 
-        # Ensure the evaluator inside Partition sees the intended wr/wv
-        geo_data.wr = wr
-        geo_data.wv = wv
+        # Ensure the optimizer reads the effective weights
+        geo_data.wr = wr_eff
+        geo_data.wv = wv_eff
 
         for t in range(trials):
             start_time = time.time()
@@ -351,16 +354,18 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
                 max_iters=max_iters,
                 prob_dict=nominal_prob,
                 Lambda=Lambda,
-                wr=wr,
-                wv=wv,
+                wr=wr_eff,
+                wv=wv_eff,
                 beta=beta,
                 Omega_dict=Omega_dict,
                 J_function=J_function
             )
             computation_time = time.time() - start_time
-            provider_cost, user_cost, total_cost = compute_cost_breakdown(
-                partition, assignment, depot, nominal_prob, Omega_dict, J_function, Lambda, wr, wv, beta
+            # Re-evaluate costs with base speeds for reporting and scalarization
+            provider_cost, user_cost, _ = compute_cost_breakdown(
+                partition, assignment, depot, nominal_prob, Omega_dict, J_function, Lambda, wr_base, wv_base, beta
             )
+            total_cost = theta * provider_cost + (1.0 - theta) * user_cost
             user_list.append(user_cost)
             prov_list.append(provider_cost)
             total_list.append(total_cost)
@@ -376,9 +381,9 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
         time_mean = float(np.mean(time_list))
 
         point = ParetoPoint(
-            wr=wr,
-            wv=wv,
-            wr_wv_ratio=ratio,
+            wr=wr_base,
+            wv=wv_base,
+            wr_wv_ratio=theta,
             user_cost=user_mean,
             user_cost_std=user_std,
             provider_cost=prov_mean,
@@ -393,9 +398,9 @@ def run_pareto_frontier_analysis(grid_size: int = 10, num_districts: int = 3,
         
         pareto_points.append(point)
         
-        print(f"   ✅ Provider cost: {prov_mean:.2f} ± {prov_std:.2f}")
-        print(f"   ✅ User cost: {user_mean:.2f} ± {user_std:.2f}")
-        print(f"   ✅ Total cost: {total_mean:.2f} ± {total_std:.2f}")
+        print(f"   ✅ Provider cost (eval): {prov_mean:.2f} ± {prov_std:.2f}")
+        print(f"   ✅ User cost (eval): {user_mean:.2f} ± {user_std:.2f}")
+        print(f"   ✅ Scalarized total θ·Prov+(1−θ)·User: {total_mean:.2f} ± {total_std:.2f}")
         print(f"   ⏱️  Time (mean over trials): {time_mean:.1f}s")
     
     # Save results
@@ -484,25 +489,35 @@ def visualize_pareto_frontier(pareto_points: List[ParetoPoint], save_path: str =
     fig.suptitle('Pareto Frontier Analysis: User vs Provider Costs', fontsize=16, fontweight='bold')
     
     # 1. Main Pareto frontier plot
-    scatter = ax1.scatter(provider_costs, user_costs, c=ratios, s=100, 
+    # Use log scale for the frontier panel; avoid zeros by flooring values
+    eps = 1e-3
+    prov_plot = [max(eps, v) for v in provider_costs]
+    user_plot = [max(eps, v) for v in user_costs]
+    prov_err_plot = [min(v*0.999, e) if v > eps else e for v, e in zip(prov_plot, prov_err)]
+    user_err_plot = [min(v*0.999, e) if v > eps else e for v, e in zip(user_plot, user_err)]
+
+    scatter = ax1.scatter(prov_plot, user_plot, c=ratios, s=100, 
                          cmap='viridis', alpha=0.8, edgecolors='black', linewidth=1)
-    ax1.errorbar(provider_costs, user_costs, xerr=prov_err, yerr=user_err,
+    ax1.errorbar(prov_plot, user_plot, xerr=prov_err_plot, yerr=user_err_plot,
                  fmt='none', ecolor='gray', alpha=0.6, capsize=3)
-    ax1.plot(provider_costs, user_costs, 'k--', alpha=0.5, linewidth=1)
+    ax1.plot(prov_plot, user_plot, 'k--', alpha=0.5, linewidth=1)
     ax1.set_xlabel('Provider Cost', fontweight='bold')
     ax1.set_ylabel('User Cost', fontweight='bold')
     ax1.set_title('Pareto Frontier: User vs Provider Costs')
+    ax1.set_xscale('log')
+    ax1.set_yscale('log')
     ax1.grid(True, alpha=0.3)
     
     # Add colorbar for wr/wv ratio
     cbar1 = plt.colorbar(scatter, ax=ax1)
-    cbar1.set_label('wr/wv Ratio', fontweight='bold')
+    # θ is the provider weight in the scalarization: θ·Provider + (1−θ)·User
+    cbar1.set_label('θ (provider weight)', fontweight='bold')
     
     # 2. Cost vs wr/wv ratio
     ax2.errorbar(ratios, user_costs, yerr=user_err, fmt='o-', label='User Cost', color='red', linewidth=2, markersize=6, capsize=3)
     ax2.errorbar(ratios, provider_costs, yerr=prov_err, fmt='s-', label='Provider Cost', color='blue', linewidth=2, markersize=6, capsize=3)
     ax2.plot(ratios, total_costs, '^-', label='Total Cost', color='purple', linewidth=2, markersize=6)
-    ax2.set_xlabel('wr/wv Ratio', fontweight='bold')
+    ax2.set_xlabel('θ (provider weight)', fontweight='bold')
     ax2.set_ylabel('Cost', fontweight='bold')
     ax2.set_title('Cost Components vs wr/wv Ratio')
     ax2.set_xscale('log')
@@ -514,7 +529,7 @@ def visualize_pareto_frontier(pareto_points: List[ParetoPoint], save_path: str =
     min_total_idx = np.argmin(total_costs)
     ax3.plot(ratios[min_total_idx], total_costs[min_total_idx], 'r*', 
              markersize=15, label=f'Minimum Total Cost\n(ratio={ratios[min_total_idx]:.3f})')
-    ax3.set_xlabel('wr/wv Ratio', fontweight='bold')
+    ax3.set_xlabel('θ (provider weight)', fontweight='bold')
     ax3.set_ylabel('Total Cost', fontweight='bold')
     ax3.set_title('Total Cost Efficiency')
     ax3.set_xscale('log')
