@@ -943,13 +943,13 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
                label='y = x (Equal Performance)')
     ]
     
-    # Sample size legend (show first 6 sample sizes with their shapes)
+    # Sample size legend (include all n, with multi-column layout to avoid overcrowding)
     size_legend = []
-    for i, n in enumerate(sample_sizes[:6]):  # Show first 6 to avoid overcrowding
+    for i, n in enumerate(sample_sizes):
         marker = markers[i % len(markers)]
         size = marker_sizes[i % len(marker_sizes)]
         size_legend.append(
-            Line2D([0], [0], marker=marker, color='w', markerfacecolor='gray', 
+            Line2D([0], [0], marker=marker, color='w', markerfacecolor='gray',
                    markersize=size, markeredgecolor='black', markeredgewidth=1,
                    label=f'n = {n}', linestyle='None')
         )
@@ -959,8 +959,10 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
                         title='Design Type', title_fontsize=13)
     ax3.add_artist(legend1)  # Keep first legend when adding second
     
-    legend2 = ax3.legend(handles=size_legend, loc='lower right', fontsize=11,
-                        title='Sample Size', title_fontsize=12, ncol=2)
+    # Choose number of columns based on count
+    ncols = 1 if len(size_legend) <= 6 else 2 if len(size_legend) <= 12 else 3
+    legend2 = ax3.legend(handles=size_legend, loc='lower right', fontsize=10,
+                        title='Sample Size', title_fontsize=11, ncol=ncols)
     
     # Add interpretation text (moved to center-left to avoid legend overlap)
     # ax3.text(0.02, 0.65, 
