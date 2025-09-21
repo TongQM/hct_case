@@ -595,7 +595,8 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
             
             # User costs
             district_wait = T_star
-            district_travel_time = (district_travel + total_linehaul) / wv
+            # Worst rider in a dispatch experiences outbound linehaul only (depot→root)
+            district_travel_time = (district_travel + root_depot_dist) / wv
             district_user_cost = wr * (district_wait + district_travel_time)
             
             # Total district cost
@@ -922,8 +923,8 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
              label='y = x (Equal Performance)')
     
     # Formatting
-    ax3.set_xlabel('Nominal Total Cost (Cost under Empirical Distribution)', fontsize=14)
-    ax3.set_ylabel('Worst-Case Total Cost (Cost under Adversarial Distribution)', fontsize=14)
+    ax3.set_xlabel('Cost under Empirical Distribution', fontsize=14)
+    ax3.set_ylabel('Cost under Adversarial Distribution', fontsize=14)
     # ax3.set_title(f'Design Performance Trade-off\\n(Nominal vs Worst-Case Performance, ε₀ = {epsilon_0})', fontsize=15, fontweight='bold')
     ax3.grid(True, alpha=0.3)
     ax3.tick_params(axis='both', which='major', labelsize=12)
@@ -955,7 +956,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
         )
     
     # Create two separate legends
-    legend1 = ax3.legend(handles=design_legend, loc='upper left', fontsize=12, 
+    legend1 = ax3.legend(handles=design_legend, loc='lower left', fontsize=12, 
                         title='Design Type', title_fontsize=13)
     ax3.add_artist(legend1)  # Keep first legend when adding second
     

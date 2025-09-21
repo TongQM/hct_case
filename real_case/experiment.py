@@ -796,65 +796,61 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         os.makedirs(fig_dir, exist_ok=True)
         out_fig = os.path.join(fig_dir, f'partitions_before_after_{ts}.pdf')
 
-        def _left_panel(ax):
-            """Plot FR partition by nearest route on ax with routes overlay."""
-            rd = RouteData('hct_routes.json', geodata)
-            # Assign each block group to nearest route name
-            nearest = rd.find_nearest_stops()
-            gdf = geodata.gdf.copy()
-            gdf['district'] = gdf.index.map(lambda idx: nearest[idx]['route'] if idx in nearest else 'Unassigned')
-            # Color by route
-            routes = sorted(gdf['district'].unique())
-            cmap = plt.get_cmap('tab20', len(routes))
-            color_map = {r: cmap(i) for i, r in enumerate(routes)}
-            for r in routes:
-                gdf[gdf['district'] == r].plot(ax=ax, color=color_map[r], edgecolor='white', linewidth=0.3)
-            # Overlay routes
-            for route in rd.routes_info:
-                name = route.get('Description', f"Route {route.get('RouteID')}")
-                color = route.get('MapLineColor', '#008080')
-                poly = route.get('EncodedPolyline')
-                if poly:
-                    try:
-                        coords = polyline.decode(poly)
-                        line = LineString([(lng, lat) for (lat, lng) in coords])
-                        proj = rd.project_geometry(line)
-                        ax.plot(*proj.xy, color=color, linewidth=1.2, alpha=0.9)
-                    except Exception:
-                        pass
-            # Highlight baseline depot block boundary in red
-            try:
-                if base_depot in gdf.index:
-                    gdf.loc[[base_depot]].boundary.plot(ax=ax, color='red', linewidth=2.0, zorder=5)
-            except Exception:
-                pass
-            ax.set_title('Original FR partition (nearest route)')
+        def _colors_by_relative_location(assign_matrix):
+            """Return mapping district_label -> color based on centroid order (top-left to bottom-right)."""
+            blocks = list(geodata.short_geoid_list)
+            klabels = []
+            for j in range(assign_matrix.shape[1]):
+                if assign_matrix[:, j].sum() > 0:
+                    klabels.append(j)
+            # Compute simple centroid per district using polygon centroids
+            centroids = {}
+            cent = geodata.gdf.geometry.centroid
+            for j in klabels:
+                idxs = [i for i in range(len(blocks)) if round(assign_matrix[i, j]) == 1]
+                if not idxs:
+                    continue
+                xs = [cent.iloc[i].x for i in idxs]
+                ys = [cent.iloc[i].y for i in idxs]
+                cx, cy = (np.mean(xs), np.mean(ys))
+                centroids[j] = (cx, cy)
+            # Order: top-left (max y, min x) to bottom-right
+            ordered = sorted(centroids.items(), key=lambda kv: (-kv[1][1], kv[1][0]))
+            cmap = plt.get_cmap('tab10', max(1, len(ordered)))
+            color_map = {}
+            for rank, (lab, _) in enumerate(ordered):
+                color_map[lab] = cmap(rank)
+            return color_map
+
+        def _plot_assignment(ax, assign_matrix, title, depot_id=None):
+            """Generic plot for a partition assignment with consistent color ordering."""
+            blocks = list(geodata.short_geoid_list)
+            labels = [int(np.argmax(assign_matrix[i, :])) if assign_matrix[i, :].sum() > 0 else -1 for i in range(len(blocks))]
+            gdfp = geodata.gdf.copy()
+            gdfp['district'] = labels
+            districts = sorted([d for d in set(labels) if d >= 0])
+            color_map = _colors_by_relative_location(assign_matrix)
+            for d in districts:
+                col = color_map.get(d, '#cccccc')
+                try:
+                    gdfp[gdfp['district'] == d].plot(ax=ax, color=col, edgecolor='white', linewidth=0.3)
+                except Exception:
+                    continue
+            if depot_id is not None and depot_id in gdfp.index:
+                try:
+                    gdfp.loc[[depot_id]].boundary.plot(ax=ax, color='red', linewidth=2.0, zorder=6)
+                except Exception:
+                    pass
+            ax.set_title(title)
             ax.set_axis_off()
 
+        def _left_panel(ax):
+            # Plot baseline (route-based) assignment using consistent color ordering
+            _plot_assignment(ax, base_assign, 'Original partition (baseline)', depot_id=base_depot)
+
         def _right_panel(ax):
-            """Plot optimized partition from assignment on ax."""
-            # Use opt_assign (square) already computed
-            assign = opt_assign
-            block_ids = list(geodata.short_geoid_list)
-            labels = []
-            for i, bi in enumerate(block_ids):
-                # Find assigned column
-                col = int(np.argmax(assign[i, :])) if assign[i, :].sum() > 0 else -1
-                labels.append(col)
-            gdf = geodata.gdf.copy()
-            gdf['district'] = labels
-            districts = sorted([d for d in set(labels) if d >= 0])
-            cmap = plt.get_cmap('tab10', max(1, len(districts)))
-            for idx, d in enumerate(districts):
-                gdf[gdf['district'] == d].plot(ax=ax, color=cmap(idx), edgecolor='white', linewidth=0.3)
-            # Highlight optimized depot block boundary in red
-            try:
-                if metrics['depot'] in gdf.index:
-                    gdf.loc[[metrics['depot']]].boundary.plot(ax=ax, color='red', linewidth=2.2, zorder=6)
-            except Exception:
-                pass
-            ax.set_title('Optimized partition (robust TSP)')
-            ax.set_axis_off()
+            # Plot optimized partition using the same color ordering rule (relative location)
+            _plot_assignment(ax, opt_assign, 'Optimized partition (robust TSP)', depot_id=metrics['depot'])
 
         fig, axes = plt.subplots(1, 2, figsize=(16, 8), constrained_layout=True)
         _left_panel(axes[0])
