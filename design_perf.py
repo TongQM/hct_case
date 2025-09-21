@@ -288,7 +288,8 @@ def optimize_service_design(geo_data: ToyGeoData,
                           num_districts: int,
                           design_type: str,
                           epsilon: float,
-                          seed: int = 42) -> DesignResult:
+                          seed: int = 42,
+                          lambda_per_hour: float = 100.0) -> DesignResult:
     """Optimize service design using RS algorithm with specified epsilon"""
     
     try:
@@ -299,9 +300,9 @@ def optimize_service_design(geo_data: ToyGeoData,
         
         # Run Random Search optimization
         depot_id, district_roots, assignment, obj_val, district_info = partition.random_search(
-            max_iters=30,  # Same as simulate_service_designs.py
+            max_iters=50,  # Same as simulate_service_designs.py
             prob_dict=prob_dict,
-            Lambda=100, wr=1.0, wv=10.0, beta=0.7120,
+            Lambda=lambda_per_hour, wr=1.0, wv=10.0, beta=0.7120,
             Omega_dict=Omega_dict,
             J_function=J_function
         )
@@ -462,7 +463,8 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
                                  design: DesignResult,
                                  prob_dict: Dict[str, float],
                                  eval_type: str,
-                                 trial_seed: int = 42) -> SimulationResult:
+                                 trial_seed: int = 42,
+                                 lambda_per_hour: float = 100.0) -> SimulationResult:
     """Evaluate design performance via PROPER vehicle simulation matching simulate_service_designs.py"""
     
     if not design.success:
@@ -476,7 +478,6 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
     try:
         # Constants matching simulate_service_designs.py
         SERVICE_HOURS = 12.0  # 8am to 8pm
-        daily_demand_rate = 100.0
         wr = 1.0  # Time-to-cost conversion factor
         wv = 10.0  # Vehicle speed (miles/hour)
         
@@ -507,11 +508,9 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
             if not assigned_blocks:
                 continue
             
-            # Calculate district arrival rate from the given distribution (nominal or worst-case)
+            # Calculate district arrival rate per hour from the given distribution (nominal or worst-case)
             district_prob_mass = sum(prob_dict.get(block_id, 0.0) for block_id in assigned_blocks)
-            district_arrival_rate = daily_demand_rate * district_prob_mass  # Demands per day
-            
-            if district_arrival_rate <= 0:
+            if district_prob_mass <= 0:
                 continue
             
             # FIXED: Use actual dispatch interval from design
@@ -535,8 +534,9 @@ def evaluate_design_via_simulation(geo_data: ToyGeoData,
             # FIXED: TSP-based travel cost with Poisson demand per dispatch
             district_travel = 0.0
             for dispatch in range(num_dispatches):
-                # Sample number of demands for this dispatch using district arrival rate
-                dispatch_lambda = district_arrival_rate * T_star / SERVICE_HOURS  # Expected demands per dispatch
+                # Sample number of demands for this dispatch using per-hour arrival rate
+                # Expected demands in one dispatch interval = (lambda_per_hour * mass) * T_star
+                dispatch_lambda = (lambda_per_hour * district_prob_mass) * T_star
                 # Use trial_seed for reproducible trials with different random realizations
                 np.random.seed(trial_seed + hash((root_id, dispatch)) % 1000)
                 dispatch_demand = np.random.poisson(dispatch_lambda)
@@ -637,7 +637,8 @@ def run_sample_size_analysis(epsilon_0: float = 2.0,
                            grid_size: int = 10,
                            num_districts: int = 3,
                            sample_sizes: List[int] = None,
-                           num_trials: int = 3) -> Dict:
+                           num_trials: int = 3,
+                           lambda_per_hour: float = 100.0) -> Dict:
     """
     Run complete sample size analysis
     
@@ -695,12 +696,12 @@ def run_sample_size_analysis(epsilon_0: float = 2.0,
         # Step 2: Generate TWO designs
         robust_design = optimize_service_design(
             geo_data, nominal_prob_dict, Omega_dict, J_function,
-            num_districts, "Robust", epsilon, seed=42+n
+            num_districts, "Robust", epsilon, seed=42+n, lambda_per_hour=lambda_per_hour
         )
         
         nominal_design = optimize_service_design(
             geo_data, nominal_prob_dict, Omega_dict, J_function,
-            num_districts, "Nominal", epsilon=0.0, seed=42+n
+            num_districts, "Nominal", epsilon=0.0, seed=42+n, lambda_per_hour=lambda_per_hour
         )
         
         # Step 3: Compute worst-case distribution  
@@ -729,18 +730,18 @@ def run_sample_size_analysis(epsilon_0: float = 2.0,
             
             # Robust design evaluations
             robust_nominal_result = evaluate_design_via_simulation(
-                geo_data, robust_design, nominal_prob_dict, "Robust on Nominal", trial_seed
+                geo_data, robust_design, nominal_prob_dict, "Robust on Nominal", trial_seed, lambda_per_hour=lambda_per_hour
             )
             robust_worst_case_result = evaluate_design_via_simulation(
-                geo_data, robust_design, worst_case_prob_dict, "Robust on Worst-Case", trial_seed
+                geo_data, robust_design, worst_case_prob_dict, "Robust on Worst-Case", trial_seed, lambda_per_hour=lambda_per_hour
             )
             
             # Nominal design evaluations  
             nominal_nominal_result = evaluate_design_via_simulation(
-                geo_data, nominal_design, nominal_prob_dict, "Nominal on Nominal", trial_seed
+                geo_data, nominal_design, nominal_prob_dict, "Nominal on Nominal", trial_seed, lambda_per_hour=lambda_per_hour
             )
             nominal_worst_case_result = evaluate_design_via_simulation(
-                geo_data, nominal_design, worst_case_prob_dict, "Nominal on Worst-Case", trial_seed
+                geo_data, nominal_design, worst_case_prob_dict, "Nominal on Worst-Case", trial_seed, lambda_per_hour=lambda_per_hour
             )
             
             # Check if all simulations succeeded
@@ -817,7 +818,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
         use_error_bars = False
     
     # Figure 1: Performance on Worst-Case Distribution
-    fig1, ax1 = plt.subplots(1, 1, figsize=(12, 8))
+    fig1, ax1 = plt.subplots(1, 1, figsize=(6, 4))
     
     if use_error_bars:
         ax1.errorbar(sample_sizes, robust_worst_case, yerr=robust_worst_case_std, 
@@ -833,7 +834,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
                  label='Nominal Design (ε = 0)')
     
     ax1.set_xlabel('Sample Size n', fontsize=14)
-    ax1.set_ylabel('Total Cost (Objective Value)', fontsize=14)
+    ax1.set_ylabel('Worst-Case Total Cost', fontsize=14)
     # ax1.set_title(f'Performance on Worst-Case Distribution\\n(Evaluation under adversarial demand, ε₀ = {epsilon_0})', fontsize=15)
     ax1.grid(True, alpha=0.3)
     ax1.legend(fontsize=12)
@@ -845,7 +846,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
     print("✅ Worst-case performance plot saved as 'worst_case_performance.pdf'")
     
     # Figure 2: Performance on Nominal Distribution
-    fig2, ax2 = plt.subplots(1, 1, figsize=(12, 8))
+    fig2, ax2 = plt.subplots(1, 1, figsize=(6, 4))
     
     if use_error_bars:
         ax2.errorbar(sample_sizes, robust_nominal, yerr=robust_nominal_std,
@@ -861,7 +862,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
                  label='Nominal Design (ε = 0)')
     
     ax2.set_xlabel('Sample Size n', fontsize=14)
-    ax2.set_ylabel('Total Cost (Objective Value)', fontsize=14)
+    ax2.set_ylabel('Nominal Total Cost', fontsize=14)
     # ax2.set_title(f'Performance on Nominal Distribution\\n(Evaluation under empirical demand, ε₀ = {epsilon_0})', fontsize=15)
     ax2.grid(True, alpha=0.3)
     ax2.legend(fontsize=12)
@@ -873,7 +874,7 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
     print("✅ Nominal performance plot saved as 'nominal_performance.pdf'")
     
     # Figure 3: Trade-off Scatter Plot (Nominal vs Worst-case Performance)
-    fig3, ax3 = plt.subplots(1, 1, figsize=(14, 10))
+    fig3, ax3 = plt.subplots(1, 1, figsize=(7, 5))
     
     # Define different shapes for different sample sizes
     markers = ['o', 's', '^', 'D', 'v', 'p', '*', 'h']
@@ -921,8 +922,8 @@ def create_performance_visualizations(results: Dict, epsilon_0: float):
              label='y = x (Equal Performance)')
     
     # Formatting
-    ax3.set_xlabel('Nominal Performance (Cost under Empirical Distribution)', fontsize=14)
-    ax3.set_ylabel('Worst-Case Performance (Cost under Adversarial Distribution)', fontsize=14)
+    ax3.set_xlabel('Nominal Total Cost (Cost under Empirical Distribution)', fontsize=14)
+    ax3.set_ylabel('Worst-Case Total Cost (Cost under Adversarial Distribution)', fontsize=14)
     # ax3.set_title(f'Design Performance Trade-off\\n(Nominal vs Worst-Case Performance, ε₀ = {epsilon_0})', fontsize=15, fontweight='bold')
     ax3.grid(True, alpha=0.3)
     ax3.tick_params(axis='both', which='major', labelsize=12)
@@ -978,19 +979,22 @@ def main():
     epsilon_0 = 2.0
     grid_size = 5  # Default grid size
     num_trials = 5  # Default number of simulation trials
+    lambda_per_hour = 100.0  # Unified arrival rate (riders/hour)
     
     # Show usage help
     if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
-        print("Usage: python design_perf.py [epsilon_0] [grid_size] [num_trials]")
+        print("Usage: python design_perf.py [epsilon_0] [grid_size] [num_trials] [lambda_per_hour]")
         print("  epsilon_0:   Base Wasserstein radius (default: 2.0)")
         print("  grid_size:   Grid resolution NxN (default: 5)")
         print("  num_trials:  Number of simulation trials for error bars (default: 5)")
+        print("  lambda_per_hour: Arrival rate per hour used in optimization AND simulation (default: 100)")
         print("  ")
         print("Examples:")
         print("  python design_perf.py                    # Default: ε₀=2.0, 5×5 grid, 5 trials")
         print("  python design_perf.py 1.5                # ε₀=1.5, 5×5 grid, 5 trials")  
         print("  python design_perf.py 2.0 10             # ε₀=2.0, 10×10 grid, 5 trials")
         print("  python design_perf.py 1.0 20 10          # ε₀=1.0, 20×20 grid, 10 trials")
+        print("  python design_perf.py 2.0 10 5 120       # ε₀=2.0, 10×10 grid, 5 trials, λ=120/hour")
         print("  ")
         print("Note: Service region is ALWAYS fixed at 10×10 miles")
         return
@@ -1003,6 +1007,8 @@ def main():
             grid_size = int(sys.argv[2])
         if len(sys.argv) > 3:
             num_trials = int(sys.argv[3])
+        if len(sys.argv) > 4:
+            lambda_per_hour = float(sys.argv[4])
     except ValueError:
         print("Error: Invalid arguments. Use -h for help.")
         return
@@ -1016,6 +1022,7 @@ def main():
     print(f"Service region: {service_region_miles}×{service_region_miles} miles (FIXED)")
     print(f"Block size: {block_size_miles:.3f}×{block_size_miles:.3f} miles")
     print(f"Simulation trials: {num_trials} per design evaluation")
+    print(f"Unified arrival rate: λ = {lambda_per_hour}/hour")
     print()
     
     # Adjust sample sizes based on grid resolution
@@ -1031,7 +1038,8 @@ def main():
         grid_size=grid_size,
         num_districts=3,
         sample_sizes=sample_sizes,
-        num_trials=num_trials  # Use command line argument
+        num_trials=num_trials,  # Use command line argument
+        lambda_per_hour=lambda_per_hour
     )
     
     if results['sample_sizes']:
