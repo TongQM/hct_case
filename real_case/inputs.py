@@ -177,9 +177,63 @@ def load_probability_from_commuting(geodata: GeoData,
     return dict(zip(bg['short_GEOID'], bg['p']))
 
 
-def load_real_odd(csv_path: str = 'data/bg_odd_features_real.csv') -> Dict[str, np.ndarray]:
-    df = pd.read_csv(csv_path, dtype={'short_GEOID': str})
-    return {r['short_GEOID']: np.array([r['omega1'], r['omega2']], dtype=float) for _, r in df.iterrows()}
+def load_real_odd(csv_path: str = 'data/odd_features.csv') -> Dict[str, np.ndarray]:
+    """
+    Load engineered ODD features and convert them into scalar penalties using Table 2/3 coefficients.
+    Elevation is shifted down by 200 m before applying the coefficient.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"ODD features CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path)
+    # Normalize column names by stripping unit suffixes " [..]"
+    rename_map = {}
+    for col in df.columns:
+        if '[' in col:
+            rename_map[col] = col.split(' [', 1)[0]
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    df['short_GEOID'] = df['GEOID'].astype(str).str[-7:]
+
+    coeffs = {
+        "curvature": 5.0,
+        "grade": 3.0,
+        "lanes": 2.0,
+        "speed": 2.5,
+        "is_bridge": 4.5,
+        "rail_present": 2.0,
+        "is_tunnel": 6.0,
+        "mean_elevation": 1.0,
+    }
+    road_type_coeffs = {
+        "busway": 1.0,
+        "motorway": 1.5,
+        "trunk": 3.0,
+        "primary": 5.5,
+        "secondary": 9.0,
+        "tertiary": 13.5,
+        "residential": 19.0,
+        "unclassified": 25.0,
+    }
+
+    odd_dict: Dict[str, float] = {}
+    for _, row in df.iterrows():
+        cost = 0.0
+        for feature, coeff in coeffs.items():
+            val = row.get(feature)
+            if pd.isna(val):
+                continue
+            if feature == "mean_elevation":
+                val = float(val) - 200.0
+            cost += coeff * float(val)
+
+        road_type = str(row.get("road_type", "unclassified")).strip().lower()
+        cost += road_type_coeffs.get(road_type, road_type_coeffs["unclassified"])
+
+        odd_dict[str(row['short_GEOID'])] = float(cost)
+
+    return {k: np.array([v], dtype=float) for k, v in odd_dict.items()}
 
 
 def load_baseline_assignment(geodata: GeoData, routes_json: str = 'hct_routes.json', visualize: bool = False) -> Tuple[np.ndarray, List[str]]:

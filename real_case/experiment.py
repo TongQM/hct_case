@@ -37,10 +37,10 @@ import os
 
 
 def J_function(omega):
-    # Linear, consistent with compute_real_odd scaling [0,5]
+    """Aggregate ODD penalty from feature vector or scalar cost."""
     if hasattr(omega, '__len__'):
-        return 0.6 * float(omega[0]) + 0.4 * float(omega[1])
-    return 0.6 * float(omega)
+        return float(np.nansum(omega))
+    return float(omega)
 
 
 def expand_to_square(partition: Partition, small_assign: np.ndarray, centers: list[str]) -> np.ndarray:
