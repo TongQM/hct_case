@@ -282,7 +282,7 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
                         prob_dict, Omega_dict, district_info=None):
     """Create the dual-panel visualization"""
     
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
     grid_size = geodata.grid_size
     service_region_miles = geodata.service_region_miles
     
@@ -415,7 +415,7 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
     if district_info is not None:
         # Get worst-case distribution from CQCP subproblem solutions
         # district_info contains tuples: (cost, root, K_i, F_i, T_star, x_star_dict)
-        # Aggregate worst-case intensities across all districts
+        # Aggregate worst-case intensities across all districts using MAX
         worst_case_intensities = {}
         
         for district_data in district_info:
@@ -425,7 +425,7 @@ def create_visualization(geodata, depot_id, district_roots, assignment, dispatch
                 for block_id, intensity in x_star_dict.items():
                     if block_id not in worst_case_intensities:
                         worst_case_intensities[block_id] = 0.0
-                    worst_case_intensities[block_id] += intensity
+                    worst_case_intensities[block_id] = max(worst_case_intensities[block_id], intensity)
         
         # Fill grid with worst-case intensities
         for i in range(grid_size):

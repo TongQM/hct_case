@@ -307,7 +307,7 @@ class RouteData:
         """
         stops_dict = {}
         
-        fig, ax = plt.subplots(figsize=(15, 15))
+        fig, ax = plt.subplots(figsize=(10, 10))
         
         # Plot block groups as the base layer (already in EPSG:2163)
         self.gdf.plot(ax=ax, color='lightgrey', edgecolor='black')
@@ -423,7 +423,7 @@ class RouteData:
                     color_map[district] = custom_colors[district]
                 else:
                     color_map[district] = cmap(i)
-            fig, ax = plt.subplots(figsize=(15, 15))
+            fig, ax = plt.subplots(figsize=(10, 10))
             for district in unique_districts:
                 subset = self.gdf[self.gdf['district'] == district]
                 subset.plot(ax=ax, color=color_map[district], edgecolor='black')

@@ -223,8 +223,10 @@ def _evaluate_fixed_route_full(geodata, prob: Dict[str, float], epsilon_km: floa
             name = route.get('Description', f"Route {route.get('RouteID')}")
             secs = [s.get('SecondsToNextStop', 0) for s in route.get('Stops', [])]
             route_headways[name] = sum(secs)
+        # For a rider waiting at a stop, worst-user wait is the full headway (just missed the bus)
         worst_user_wait_time = max(route_headways.values()) if route_headways else None
-        # max transit to destination over nodes
+
+        # Max transit time to destination over nodes (board at nearest stop, ride to dest stop)
         dest_name = 'Walmart (Garden Center)'
         worst_user_transit_time = 0.0
         for n in nodes:
@@ -329,7 +331,7 @@ def _evaluate_tsp_partition(
     """
     # Constants for conversion
     # Use km/h consistently
-    wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 10.0) * 1.60934)
+    wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 18.710765208297367 / 1.60934) * 1.60934)
     # build evaluator only if needed
     rd = RouteData('hct_routes.json', geodata)
     ev = Evaluate(rd, geodata, epsilon=epsilon_km if epsilon_km is not None else 1e-3)
