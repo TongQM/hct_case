@@ -5,6 +5,7 @@ from gurobipy import GRB
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from lib.data import GeoData
+from lib.constants import TSP_TRAVEL_DISCOUNT
 import logging
 import concurrent.futures
 from functools import partial
@@ -431,7 +432,7 @@ class Partition:
         # Extract solution
         x_star = np.array([x[j].X for j in range(N)])
         
-        # alpha_i is the optimal objective value of the CQCP with BHH coefficient: 
+        # alpha_i is the optimal objective value of the CQCP with BHH coefficient:
         # α_i = β * √Λ * Σ x_j * sqrt(area_j) * z_ji
         # Get BHH coefficient β and overall arrival rate Λ
         if beta is None:
@@ -439,10 +440,13 @@ class Partition:
         if Lambda is None:
             Lambda = getattr(self.geodata, 'Lambda', 30.0)  # Default overall arrival rate
         
+        travel_discount = getattr(self.geodata, 'tsp_travel_discount', TSP_TRAVEL_DISCOUNT)
+        
         # Raw alpha without BHH factors
         raw_alpha = np.sum(x_star * np.sqrt(area_vec) * z_assignment)
         # Apply BHH coefficient: α_i = β * √Λ * raw_alpha
         alpha_i = beta * np.sqrt(Lambda) * raw_alpha
+        alpha_provider = alpha_i / travel_discount
         
         # Use speeds consistent with distance units (km). Prefer km/h if available.
         wr = getattr(self.geodata, 'wr_kmh', None)
@@ -459,15 +463,19 @@ class Partition:
         
         def g_bar_objective(ci):
             """Objective function g_bar(ci)"""
-            return ((K_i + F_i) * ci**-2 + wr/(2*wv) * K_i + wr * ci**2) + (ci**-1 + wr/wv * ci) * alpha_i
+            provider = (K_i + F_i) * ci**-2 + alpha_provider * ci**-1
+            rider_linehaul = wr/(2*wv) * K_i
+            rider_travel = (wr/wv) * alpha_i * ci
+            rider_wait = wr * ci**2
+            return provider + rider_linehaul + rider_travel + rider_wait
         
         def g_bar_derivative(ci):
             """First derivative dg_bar/dci"""
-            return (-2*(K_i + F_i) * ci**-3 + 2*wr*ci - alpha_i * ci**-2 + (wr/wv) * alpha_i)
+            return (-2*(K_i + F_i) * ci**-3 - alpha_provider * ci**-2 + 2*wr*ci + (wr/wv) * alpha_i)
         
         def g_bar_second_derivative(ci):
             """Second derivative d²g_bar/dci²"""
-            return (6*(K_i + F_i) * ci**-4 + 2*wr + 2*alpha_i * ci**-3)
+            return (6*(K_i + F_i) * ci**-4 + 2*alpha_provider * ci**-3 + 2*wr)
         
         # Newton's method starting from a reasonable initial guess
         ci_star = np.sqrt(max(1.0, min(10.0, wv/wr)))  # Start near the high-Lambda limit
@@ -509,7 +517,7 @@ class Partition:
         
         # Subgradients w.r.t. master problem variables
         # ∂g/∂α_i
-        g_alpha = ci_star**-1 + wr/wv * ci_star
+        g_alpha = (ci_star**-1 / travel_discount) + wr/wv * ci_star
         # ∂g/∂K_i  
         g_K = ci_star**-2 + wr/(2*wv)
         # ∂g/∂F_i

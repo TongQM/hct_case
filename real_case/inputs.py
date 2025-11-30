@@ -66,7 +66,7 @@ def compute_vehicle_speed_kmh(geodata: GeoData, routes_json: str = 'hct_routes.j
 def set_geodata_speeds(
     geodata: GeoData,
     routes_json: str = 'hct_routes.json',
-    walk_kmh: float = 5.04,
+    walk_kmh: float = 0.0,
     vehicle_kmh: float = 18.710765208297367,
     compute_from_routes: bool = False,
 ) -> tuple[float, float]:
@@ -85,7 +85,7 @@ def set_geodata_speeds(
     geodata.wr_kmh = walk_kmh
     # Also store mph for any legacy code paths
     geodata.wv = vehicle_kmh / 1.60934
-    geodata.wr = walk_kmh / 1.60934
+    geodata.wr = 0.0 if walk_kmh == 0 else walk_kmh / 1.60934
     return vehicle_kmh, walk_kmh
 
 
@@ -185,7 +185,8 @@ def load_real_odd(csv_path: str = 'data/odd_features.csv') -> Dict[str, np.ndarr
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"ODD features CSV not found: {csv_path}")
 
-    df = pd.read_csv(csv_path)
+    # Force GEOID to string to avoid scientific-notation float parsing
+    df = pd.read_csv(csv_path, dtype=str)
     # Normalize column names by stripping unit suffixes " [..]"
     rename_map = {}
     for col in df.columns:
@@ -194,7 +195,9 @@ def load_real_odd(csv_path: str = 'data/odd_features.csv') -> Dict[str, np.ndarr
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    df['short_GEOID'] = df['GEOID'].astype(str).str[-7:]
+    geocol = next((c for c in df.columns if c.lower().startswith('geoid')), 'GEOID')
+    df['GEOID'] = df[geocol].astype(str)
+    df['short_GEOID'] = df['GEOID'].str.replace(r'\\.0$', '', regex=True).str[-7:]
 
     coeffs = {
         "curvature": 5.0,

@@ -7,6 +7,7 @@ import simpy
 from shapely.geometry import LineString, Point
 
 from lib.data import GeoData, RouteData
+from lib.constants import TSP_TRAVEL_DISCOUNT
 
 '''
 Compare the costs incurred by different entities using different partitions plus operations.
@@ -54,6 +55,7 @@ class Evaluate:
         self.level = geodata.level
         self.short_geoid_list = geodata.short_geoid_list
         self.epsilon = epsilon
+        self.tsp_travel_discount = getattr(geodata, 'tsp_travel_discount', TSP_TRAVEL_DISCOUNT)
 
 
     # ==========================================================
@@ -500,9 +502,6 @@ class Evaluate:
         else:
             Tmin = 1e-3
             Tmax = max_dipatch_interval  # Use argument as the upper bound for search
-            grid_points = 20
-            best_T = Tmin
-            best_obj = float('inf')
             # For legacy compatibility, set K_i and F_i to 0 (or use actual values if available)
             try:
                 K_i = float(self.geodata.get_K(center))
@@ -515,19 +514,43 @@ class Evaluate:
             wr = getattr(self.geodata, 'wr', 1.0)
             wv = getattr(self.geodata, 'wv', 10.0)
             alpha_i = district_prob_sqrt  # for compatibility with Partition convention
-            for T in np.linspace(Tmin, Tmax, grid_points):
-                ci = np.sqrt(T)
-                g_bar = (K_i+F_i)*ci**-2 + alpha_i*ci**-1 + wr/(2*wv)*K_i + wr/wv*alpha_i*ci + wr*ci**2
-                if g_bar < best_obj:
-                    best_obj = g_bar
-                    best_T = T
-            interval = best_T
+            travel_discount = getattr(self.geodata, 'tsp_travel_discount', TSP_TRAVEL_DISCOUNT)
+            alpha_provider = alpha_i / travel_discount if travel_discount else alpha_i
+
+            # Newton's method for optimal ci (dispatch subinterval)
+            def g_bar_objective(ci):
+                provider = (K_i + F_i) * ci**-2 + alpha_provider * ci**-1
+                rider_linehaul = wr/(2*wv) * K_i
+                rider_travel = (wr/wv) * alpha_i * ci
+                rider_wait = wr * ci**2
+                return provider + rider_linehaul + rider_travel + rider_wait
+
+            def g_bar_derivative(ci):
+                return (-2*(K_i + F_i) * ci**-3 - alpha_provider * ci**-2 + 2*wr*ci + (wr/wv) * alpha_i)
+
+            def g_bar_second_derivative(ci):
+                return (6*(K_i + F_i) * ci**-4 + 2*alpha_provider * ci**-3 + 2*wr)
+
+            ci_star = math.sqrt(max(Tmin, min(Tmax, wv / wr))) if wr > 0 else math.sqrt(max(Tmin, min(Tmax, 1.0)))
+            for _ in range(20):
+                grad = g_bar_derivative(ci_star)
+                hess = g_bar_second_derivative(ci_star)
+                if abs(grad) < 1e-8 or hess == 0:
+                    break
+                ci_new = ci_star - grad / hess
+                ci_new = max(math.sqrt(Tmin), min(ci_new, math.sqrt(Tmax)))
+                if abs(ci_new - ci_star) < 1e-10:
+                    ci_star = ci_new
+                    break
+                ci_star = ci_new
+            interval = ci_star ** 2
 
         mean_wait_time_per_interval_per_rider = interval / 2
         mean_transit_distance_per_interval = BETA * math.sqrt(overall_arrival_rate * interval) * district_prob_sqrt
+        provider_transit_distance_per_interval = mean_transit_distance_per_interval / self.tsp_travel_discount
 
         # amt_wait_time = mean_wait_time_per_interval_per_rider / interval
-        amt_transit_distance = mean_transit_distance_per_interval / interval
+        amt_transit_distance = provider_transit_distance_per_interval / interval
 
         results_dict = {
             'district_center': center,
@@ -536,6 +559,7 @@ class Evaluate:
             'district_prob_sqrt': district_prob_sqrt,
             'mean_wait_time_per_interval_per_rider': mean_wait_time_per_interval_per_rider,
             'mean_transit_distance_per_interval': mean_transit_distance_per_interval,
+            'provider_mean_transit_distance_per_interval': provider_transit_distance_per_interval,
             'amt_transit_distance': amt_transit_distance,
         }
 

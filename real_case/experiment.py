@@ -29,6 +29,7 @@ from real_case.inputs import (
 from lib.algorithm import Partition
 from lib.data import RouteData
 from lib.evaluate import Evaluate
+from lib.constants import TSP_TRAVEL_DISCOUNT
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from shapely.geometry import LineString
@@ -85,7 +86,7 @@ def evaluate_design(partition: Partition, assignment: np.ndarray, prob_dict, Ome
     depot_id = partition.optimize_depot_location(assignment, roots, prob_dict)
     obj, district_info = partition.evaluate_partition_objective(
         assignment, depot_id, prob_dict,
-        Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+        Lambda=1.0, wr=0.0, wv=10.0, beta=0.7120,
         Omega_dict=Omega_dict, J_function=J_function
     )
     # Summaries
@@ -332,6 +333,7 @@ def _evaluate_tsp_partition(
     # Constants for conversion
     # Use km/h consistently
     wv = getattr(geodata, 'wv_kmh', getattr(geodata, 'wv', 18.710765208297367 / 1.60934) * 1.60934)
+    travel_discount = getattr(geodata, 'tsp_travel_discount', TSP_TRAVEL_DISCOUNT)
     # build evaluator only if needed
     rd = RouteData('hct_routes.json', geodata)
     ev = Evaluate(rd, geodata, epsilon=epsilon_km if epsilon_km is not None else 1e-3)
@@ -357,6 +359,12 @@ def _evaluate_tsp_partition(
             wait_per_rider_h = T / 2.0
 
             dist_interval_service = float(dres['mean_transit_distance_per_interval'])
+            provider_service_distance = float(
+                dres.get(
+                    'provider_mean_transit_distance_per_interval',
+                    dist_interval_service / travel_discount if travel_discount else dist_interval_service,
+                )
+            )
             # District mass for aggregation; prefer evaluation's distribution (worst/expected)
             district_mass = float(dres.get('district_prob', mass_by_root.get(root, 0.0)))
             # Average in-vehicle service time per rider uses the shared-travel identity:
@@ -385,14 +393,17 @@ def _evaluate_tsp_partition(
             if linehaul_kmph == 0.0 and depot_id not in assigned_blocks:
                 print(f"[WARN] linehaul_kmph=0 for root={root}, dr_min={dr_min:.6f}, T={T:.6f}, depot not in district")
 
-            omega_vec = np.zeros(2)
+            omega_vec = None  # lazily initialize to preserve Omega vector shape
             for b in assigned_blocks:
                 if b in Omega:
-                    ov = Omega[b]
-                    omega_vec = np.maximum(omega_vec, ov)
-            odd_cost = float(J_function(omega_vec)) / T
+                    ov = np.array(Omega[b], dtype=float)
+                    omega_vec = ov if omega_vec is None else np.maximum(omega_vec, ov)
+            if omega_vec is None:
+                odd_cost = 0.0
+            else:
+                odd_cost = float(J_function(omega_vec)) / T
 
-            dist_interval_provider_total = dist_interval_service + 2.0 * dr_min
+            dist_interval_provider_total = provider_service_distance + 2.0 * dr_min
             travel_kmph = (dist_interval_provider_total / T) if T > 0 else 0.0
 
             # Add on-board half-linehaul time to average rider transit
@@ -436,7 +447,7 @@ def _evaluate_tsp_partition(
             'provider_travel_kmph': provider_travel,
         }
 
-    # Worst-case
+    # Worst-case (let T be re-optimized under worst-P)
     eval_worst = ev.evaluate_tsp_mode(
         prob_dict=prob,
         node_assignment=assignment,
@@ -445,7 +456,7 @@ def _evaluate_tsp_partition(
         overall_arrival_rate=overall_arrival_rate,
         worst_case=True,
         max_dipatch_interval=max_dispatch_interval,
-        fixed_T_by_district=override_T_by_partition,
+        fixed_T_by_district=None,
     )
     per_worst, agg_worst = build_metrics(eval_worst)
 
@@ -505,7 +516,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
         result = part.benders_decomposition(
             max_iterations=50, tolerance=1e-3, verbose=True,
             Omega_dict=Omega, J_function=J_function,
-            Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120
+            Lambda=1.0, wr=0.0, wv=10.0, beta=0.7120
         )
         # Support both dict and tuple legacy returns
         if isinstance(result, dict):
@@ -549,7 +560,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
             pass
     else:
         depot, roots, assign, obj_val, rs_district_info = part.random_search(
-            max_iters=max_iters, prob_dict=prob, Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+            max_iters=max_iters, prob_dict=prob, Lambda=1.0, wr=0.0, wv=10.0, beta=0.7120,
             Omega_dict=Omega, J_function=J_function
         )
         opt_assign = assign
@@ -593,7 +604,7 @@ def run(method: str, num_districts: int, visualize_baseline: bool = False, max_i
     try:
         _obj_base, _district_info_base = part.evaluate_partition_objective(
             base_assign, base_depot, prob,
-            Lambda=1.0, wr=1.0, wv=10.0, beta=0.7120,
+            Lambda=1.0, wr=0.0, wv=10.0, beta=0.7120,
             Omega_dict=Omega, J_function=J_function
         )
         T_override_base = {str(info[1]): float(info[4]) for info in _district_info_base}
